@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OpenAIRE scraper outputs
+openaire_software_*.csv
+openaire_cache.sqlite
+openaire_scrape_*.log
+
+# Plots
+*.png
+*.pdf
+*.svg
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
