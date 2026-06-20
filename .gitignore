@@ -53,3 +53,12 @@ openaire_scrape_*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# log files
+*.log
+
+# Temporary csv files
+*.csv
+
+# doi cache
+doi_cache.sqlite
