@@ -40,4 +40,41 @@ python openaire.py --clear-cache
 
 ---
 
+## bio.tools Scatter Plot Generator
+
+The `biotools_scatter.py` script analyzes bio.tools entries to compare publication dates with entry creation dates.
+
+### What it does
+
+- **Processes bio.tools JSON files** from the data directory structure
+- **Extracts publication dates** by fetching DOI metadata from Crossref API
+- **Compares dates** between first publication and bio.tools entry creation
+- **Implements caching** via `requests-cache` to store Crossref API responses in `doi_cache.sqlite`
+- **Generates a combined visualization** with:
+  - Scatter plot of entry creation vs publication date
+  - Marginal density distributions
+  - Color-coded time difference between dates
+- **Outputs summary statistics** including average lag, median lag, and percentage of entries created after publication
+
+### Usage
+
+```bash
+# Process bio.tools data and generate plot
+python biotools_scatter.py --data-dir /path/to/content/data
+
+# Custom output filename
+python biotools_scatter.py -d /path/to/content/data -o my_plot.png
+
+# Clear the DOI cache
+python biotools_scatter.py --clear-cache
+```
+
+### Output
+
+- `biotools-entries-publication-combined.png` (or custom `-o` filename): Combined scatter plot with marginal distributions
+- `doi_cache.sqlite`: Cached Crossref API responses
+- Log files with timestamped execution details and summary statistics
+
+---
+
 *This README was created with the help of the opencode AI agent (model: litellm/medium).*
