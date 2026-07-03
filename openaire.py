@@ -387,7 +387,7 @@ def get_openaire_research_software_counts_by_year(start_year=2000, end_year=2024
 def plot_research_software_counts(
     year_counts, plot_file, start_year, end_year, y_scale="linear"
 ):
-    """Generate the OpenAIRE research software yearly count plot."""
+    """Generate the OpenAIRE research software publication-year count plot."""
     fig, ax = plt.subplots(figsize=(12, 10))
     ax.bar(
         year_counts.index,
@@ -396,12 +396,12 @@ def plot_research_software_counts(
         edgecolor="black",
     )
     ax.set_xlabel("Year", fontsize=12)
-    ax.set_ylabel("Number of new research software records", fontsize=12)
+    ax.set_ylabel("Number of research software records", fontsize=12)
     if y_scale == "log":
         ax.set_yscale("symlog", linthresh=1)
 
     title_text = (
-        f"New Research Software Records per year of publication {start_year}-{end_year}"
+        f"Research Software Records by publication year {start_year}-{end_year}"
     )
     if y_scale == "log":
         title_text = f"{title_text} (log-scale y axis)"
@@ -412,8 +412,8 @@ def plot_research_software_counts(
 
     ax.grid(axis="y", alpha=0.3, linestyle="--")
 
-    recent_years = year_counts[year_counts.index >= year_counts.index.max() - 10]
-    for year, count in recent_years.items():
+    decade_years = year_counts[(year_counts.index % 10 == 0) & (year_counts > 0)]
+    for year, count in decade_years.items():
         ax.text(
             year,
             count,

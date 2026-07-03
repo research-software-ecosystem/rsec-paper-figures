@@ -13,7 +13,7 @@ The `openaire.py` script fetches research software metadata from the OpenAIRE Gr
 - **Implements caching** via `requests-cache` to store API responses in an SQLite database, reducing redundant API calls on re-runs
 - **Handles errors gracefully** with automatic retries, exponential backoff, and cursor-based paging
 - **Saves checkpoints** after processing each year, allowing resumption if interrupted
-- **Generates a bar plot** showing the number of new research software records per year (when `--plot` is specified)
+- **Generates a bar plot** showing research software records by publication year (when `--plot` is specified)
 
 ### Usage
 
@@ -27,10 +27,10 @@ python openaire.py --start-year 2000 --end-year 2024
 # With custom output file and plot
 python openaire.py -s 2010 -e 2024 -o results.csv -p software_per_year.png
 
-# Generate the yearly figure from annual counts without downloading all metadata
+# Generate the publication-year figure from annual counts without downloading all metadata
 python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_per_year.png
 
-# Generate a log-scale variant of the yearly figure
+# Generate a log-scale variant of the publication-year figure
 python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_per_year_log.png --y-scale log
 
 # Clear the API cache
@@ -42,7 +42,7 @@ python openaire.py --clear-cache
 - `openaire_software_complete.csv` (or custom `-o` filename): CSV with columns `title`, `year`, `month`, `year_month`, `url`, `pid`
 - `openaire_research_software_counts.csv` when `--counts-only` is used: CSV with columns `year`, `count`
 - `openaire_cache.sqlite`: Cached API responses
-- Optional PNG plot showing software publications per year
+- Optional PNG plot showing research software records by publication year
 - Log files with timestamped execution details
 
 ---
