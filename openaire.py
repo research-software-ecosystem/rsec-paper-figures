@@ -341,8 +341,8 @@ def fetch_research_software_count_for_year(year, cache_hits, cache_misses):
         "page": 1,
         "pageSize": 1,
         "type": RESEARCH_SOFTWARE_TYPE,
-        "fromPublicationDate": str(year),
-        "toPublicationDate": str(year),
+        "fromPublicationDate": f"{year}-01-01",
+        "toPublicationDate": f"{year}-12-31",
     }
 
     response = session.get(OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30)
