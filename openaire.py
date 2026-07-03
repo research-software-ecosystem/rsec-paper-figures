@@ -305,9 +305,16 @@ def get_openaire_software_by_month(
                 f"\n=== Processing {year}-{month:02d} ({from_date} to {to_date}) ==="
             )
 
-            # Use the fetch_with_fallback function that automatically splits periods if 10k limit is hit
-            month_count, cache_hits, cache_misses = fetch_with_fallback(
-                from_date, to_date, year, month, all_software, cache_hits, cache_misses
+            month_count, _, cache_hits, cache_misses = fetch_research_software_for_period(
+                from_date,
+                to_date,
+                year,
+                month,
+                all_software,
+                cache_hits,
+                cache_misses,
+                retry_on_error=retry_on_error,
+                max_retries=max_retries,
             )
 
             logger.info(
