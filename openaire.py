@@ -37,8 +37,38 @@ session = CachedSession(
 
 logger.info(f"Requests cache enabled: openaire_cache.sqlite")
 
+# OpenAIRE documents research software as research products with type=software.
+OPENAIRE_RESEARCH_PRODUCTS_URL = "https://api.openaire.eu/graph/v2/researchProducts"
+RESEARCH_SOFTWARE_TYPE = "software"
+PAGE_SIZE = 100
 
-def fetch_software_for_period(
+
+def first_value(value):
+    """Return a useful scalar from an OpenAIRE value that may be a list."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def get_research_software_url(item):
+    """Extract the most useful URL exposed by the Graph API response."""
+    code_repository_url = first_value(item.get("codeRepositoryUrl"))
+    if code_repository_url:
+        return code_repository_url
+
+    documentation_url = first_value(item.get("documentationUrls"))
+    if documentation_url:
+        return documentation_url
+
+    for instance in item.get("instances") or []:
+        url = first_value(instance.get("urls"))
+        if url:
+            return url
+
+    return None
+
+
+def fetch_research_software_for_period(
     from_date,
     to_date,
     year,
@@ -50,22 +80,21 @@ def fetch_software_for_period(
     max_retries=3,
 ):
     """
-    Fetch software for a specific date period.
-    Returns (period_count, hit_limit, new_cache_hits, new_cache_misses)
-    If hit_limit is True, it means we hit the 10k limit and need to split.
+    Fetch research software for a specific publication-date period.
+    Returns (period_count, hit_limit, new_cache_hits, new_cache_misses).
     """
     logger.info(f"  Processing {from_date} to {to_date}")
     period_count = 0
-    page = 1
+    cursor = "*"
     hit_limit = False
 
     while True:
         params = {
-            "format": "json",
-            "size": 100,
-            "page": page,
-            "fromDateAccepted": from_date,
-            "toDateAccepted": to_date,
+            "pageSize": PAGE_SIZE,
+            "cursor": cursor,
+            "type": RESEARCH_SOFTWARE_TYPE,
+            "fromPublicationDate": from_date,
+            "toPublicationDate": to_date,
         }
 
         retry_count = 0
@@ -75,11 +104,11 @@ def fetch_software_for_period(
         while not success and retry_count < max_retries:
             try:
                 logger.debug(
-                    f"Requesting {from_date} to {to_date}, page {page}, attempt {retry_count + 1}"
+                    f"Requesting {from_date} to {to_date}, cursor {cursor}, attempt {retry_count + 1}"
                 )
 
                 response = session.get(
-                    "https://api.openaire.eu/search/software", params=params, timeout=30
+                    OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30
                 )
 
                 if response.from_cache:
@@ -90,15 +119,7 @@ def fetch_software_for_period(
                 response.raise_for_status()
                 data = response.json()
 
-                response_data = data.get("response", {})
-                results_data = response_data.get("results")
-
-                if results_data is None or not isinstance(results_data, dict):
-                    success = True
-                    has_results = False
-                    break
-
-                results = results_data.get("result", [])
+                results = data.get("results", [])
 
                 if not results or results is None:
                     success = True
@@ -109,35 +130,15 @@ def fetch_software_for_period(
 
                 for item in results:
                     try:
-                        metadata = (
-                            item.get("metadata", {})
-                            .get("oaf:entity", {})
-                            .get("oaf:result", {})
-                        )
-
-                        title_obj = metadata.get("title", {})
-                        if isinstance(title_obj, dict):
-                            title = title_obj.get("$", "N/A")
-                        elif isinstance(title_obj, list) and len(title_obj) > 0:
-                            title = (
-                                title_obj[0].get("$", "N/A")
-                                if isinstance(title_obj[0], dict)
-                                else "N/A"
+                        result_type = item.get("type")
+                        if result_type != RESEARCH_SOFTWARE_TYPE:
+                            logger.warning(
+                                f"Skipping non-software OpenAIRE result {item.get('id')}: type={result_type}"
                             )
-                        else:
-                            title = "N/A"
+                            continue
 
-                        url_obj = metadata.get("websiteurl", {})
-                        if isinstance(url_obj, dict):
-                            url = url_obj.get("$")
-                        elif isinstance(url_obj, list) and len(url_obj) > 0:
-                            url = (
-                                url_obj[0].get("$")
-                                if isinstance(url_obj[0], dict)
-                                else None
-                            )
-                        else:
-                            url = None
+                        title = item.get("mainTitle") or "N/A"
+                        url = get_research_software_url(item)
 
                         all_software.append(
                             {
@@ -146,38 +147,34 @@ def fetch_software_for_period(
                                 "month": month,
                                 "year_month": f"{year}-{month:02d}",
                                 "url": url,
-                                "pid": item.get("header", {}).get(
-                                    "dri:objIdentifier", "N/A"
-                                ),
+                                "pid": item.get("id", "N/A"),
                             }
                         )
                         period_count += 1
                     except Exception as item_error:
                         logger.error(
-                            f"Error processing individual item in {from_date}-{to_date}, page {page}"
+                            f"Error processing individual item in {from_date}-{to_date}, cursor {cursor}"
                         )
                         logger.error(f"Item error: {item_error}")
                         traceback.print_exc()
                         continue
 
                 logger.info(
-                    f"    Page {page}: +{len(results)} software (period total: {period_count})"
+                    f"    Cursor page: +{len(results)} research software records (period total: {period_count})"
                 )
 
-                # Check if we've hit the 10k limit
-                if page * 100 >= 10000:
-                    logger.warning(
-                        f"    ⚠️  Hit 10k limit for {from_date} to {to_date}!"
-                    )
-                    hit_limit = True
+                next_cursor = data.get("header", {}).get("nextCursor")
+                if not next_cursor or next_cursor == cursor:
                     success = True
                     has_results = False
                     break
 
+                cursor = next_cursor
+
                 success = True
 
             except Exception as e:
-                logger.error(f"\n❌ Error on {from_date}-{to_date}, page {page}:")
+                logger.error(f"\n❌ Error on {from_date}-{to_date}, cursor {cursor}:")
                 logger.error(f"Error type: {type(e).__name__}")
                 logger.error(f"Error message: {e}")
                 traceback.print_exc()
@@ -197,7 +194,6 @@ def fetch_software_for_period(
         if not success or not has_results:
             break
 
-        page += 1
         try:
             if not response.from_cache:
                 time.sleep(0.5)
@@ -220,7 +216,7 @@ def fetch_with_fallback(
     current_depth=0,
 ):
     """
-    Recursively fetch software for a date period, splitting if we hit the 10k limit.
+    Recursively fetch research software for a date period, splitting if needed.
     """
     if current_depth >= max_depth:
         logger.error(
@@ -228,8 +224,10 @@ def fetch_with_fallback(
         )
         return 0, cache_hits, cache_misses
 
-    period_count, hit_limit, cache_hits, cache_misses = fetch_software_for_period(
-        from_date, to_date, year, month, all_software, cache_hits, cache_misses
+    period_count, hit_limit, cache_hits, cache_misses = (
+        fetch_research_software_for_period(
+            from_date, to_date, year, month, all_software, cache_hits, cache_misses
+        )
     )
 
     if hit_limit:
@@ -285,7 +283,7 @@ def fetch_with_fallback(
 def get_openaire_software_by_month(
     start_year=2000, end_year=2024, retry_on_error=True, max_retries=3
 ):
-    """Get software month by month to bypass the 10k limit"""
+    """Get OpenAIRE research software month by month."""
     all_software = []
     cache_hits = 0
     cache_misses = 0
@@ -312,7 +310,9 @@ def get_openaire_software_by_month(
                 from_date, to_date, year, month, all_software, cache_hits, cache_misses
             )
 
-            logger.info(f"Total for {year}-{month:02d}: {month_count} software")
+            logger.info(
+                f"Total for {year}-{month:02d}: {month_count} research software records"
+            )
 
         # Save checkpoint after each year
         if all_software:
@@ -335,13 +335,106 @@ def get_openaire_software_by_month(
     return pd.DataFrame(all_software)
 
 
+def fetch_research_software_count_for_year(year, cache_hits, cache_misses):
+    """Fetch the OpenAIRE count of research software records for one year."""
+    params = {
+        "page": 1,
+        "pageSize": 1,
+        "type": RESEARCH_SOFTWARE_TYPE,
+        "fromPublicationDate": str(year),
+        "toPublicationDate": str(year),
+    }
+
+    response = session.get(OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30)
+    if response.from_cache:
+        cache_hits += 1
+    else:
+        cache_misses += 1
+
+    response.raise_for_status()
+    data = response.json()
+    count = data.get("header", {}).get("numFound", 0)
+
+    if not response.from_cache:
+        time.sleep(0.5)
+
+    return int(count), cache_hits, cache_misses
+
+
+def get_openaire_research_software_counts_by_year(start_year=2000, end_year=2024):
+    """Get annual OpenAIRE research software counts without downloading metadata."""
+    rows = []
+    cache_hits = 0
+    cache_misses = 0
+
+    for year in range(start_year, end_year + 1):
+        logger.info(f"Fetching research software count for {year}")
+        count, cache_hits, cache_misses = fetch_research_software_count_for_year(
+            year, cache_hits, cache_misses
+        )
+        rows.append({"year": year, "count": count})
+        logger.info(f"  {year}: {count}")
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info("=== Count Cache Statistics ===")
+    logger.info(f"{'=' * 60}")
+    logger.info(f"Cache hits: {cache_hits}")
+    logger.info(f"Cache misses (API calls): {cache_misses}")
+
+    return pd.DataFrame(rows)
+
+
+def plot_research_software_counts(
+    year_counts, plot_file, start_year, end_year, y_scale="linear"
+):
+    """Generate the OpenAIRE research software yearly count plot."""
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.bar(
+        year_counts.index,
+        year_counts.values,
+        color="steelblue",
+        edgecolor="black",
+    )
+    ax.set_xlabel("Year", fontsize=12)
+    ax.set_ylabel("Number of new research software records", fontsize=12)
+    if y_scale == "log":
+        ax.set_yscale("symlog", linthresh=1)
+
+    title_text = (
+        f"New Research Software Records per year of publication {start_year}-{end_year}"
+    )
+    if y_scale == "log":
+        title_text = f"{title_text} (log-scale y axis)"
+    subtitle_text = (
+        f"source: OpenAIRE Graph API, retrieved on {datetime.now().strftime('%Y-%m-%d')}"
+    )
+    ax.set_title(f"{title_text}\n{subtitle_text}", fontsize=12, fontweight="bold")
+
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    recent_years = year_counts[year_counts.index >= year_counts.index.max() - 10]
+    for year, count in recent_years.items():
+        ax.text(
+            year,
+            count,
+            str(count),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    plt.tight_layout()
+    plt.savefig(plot_file, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
 if __name__ == "__main__":
     import sys
     import argparse
 
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Scrape software metadata from OpenAIRE API",
+        description="Scrape research software metadata from the OpenAIRE Graph API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -350,7 +443,7 @@ Examples:
   python openaire.py --end-year 2020    # End at year 2020
   python openaire.py -s 2010 -e 2020    # Custom range
   python openaire.py -o results.csv     # Custom output CSV file
-  python openaire.py -p plot.png        # Generate a plot of software per year
+  python openaire.py -p plot.png        # Generate a plot of research software per year
   python openaire.py --clear-cache      # Clear the API cache and exit
         """,
     )
@@ -385,6 +478,17 @@ Examples:
         default=None,
         help="Output plot file name (e.g., software_per_year.png). If not specified, no plot is generated",
     )
+    parser.add_argument(
+        "--counts-only",
+        action="store_true",
+        help="Fetch annual OpenAIRE counts only, useful for generating the yearly figure without downloading all metadata",
+    )
+    parser.add_argument(
+        "--y-scale",
+        choices=["linear", "log"],
+        default="linear",
+        help="Y-axis scale for generated plots (default: linear). The log option uses a symmetric log scale so zero-count years remain visible.",
+    )
 
     args = parser.parse_args()
 
@@ -412,22 +516,27 @@ Examples:
         sys.exit(1)
 
     try:
-        logger.info("Starting OpenAIRE software scraping (MONTH BY MONTH)")
-        logger.info(
-            "This will make more API calls but avoid hitting limits per time period"
-        )
         logger.info(f"Year range: {args.start_year} to {args.end_year}")
-        print('A')
 
-        df = get_openaire_software_by_month(args.start_year, args.end_year)
-        print('B')
-        # Save to CSV
         output_file = args.output
-        df.to_csv(output_file, index=False)
-        logger.info(f"\n✓ Saved results to {output_file}")
-        print('C')
-        logger.info(args.plot)
-        print('D')
+
+        if args.counts_only:
+            logger.info("Starting OpenAIRE research software count retrieval")
+            logger.info("Using Graph API researchProducts with type=software")
+            df = get_openaire_research_software_counts_by_year(
+                args.start_year, args.end_year
+            )
+            df.to_csv(output_file, index=False)
+            logger.info(f"\n✓ Saved annual counts to {output_file}")
+        else:
+            logger.info("Starting OpenAIRE research software scraping (MONTH BY MONTH)")
+            logger.info(
+                "Using Graph API researchProducts with type=software and cursor paging"
+            )
+            df = get_openaire_software_by_month(args.start_year, args.end_year)
+            df.to_csv(output_file, index=False)
+            logger.info(f"\n✓ Saved results to {output_file}")
+
         # Generate plot if requested
         if args.plot:
             if not PLOTTING_AVAILABLE:
@@ -436,44 +545,18 @@ Examples:
             else:
                 try:
                     logger.info(f"\nGenerating plot: {args.plot}")
-                    year_counts = df.groupby("year").size().sort_index()
+                    if args.counts_only:
+                        year_counts = df.set_index("year")["count"].sort_index()
+                    else:
+                        year_counts = df.groupby("year").size().sort_index()
 
-                    fig, ax = plt.subplots(figsize=(12, 10))
-                    ax.bar(
-                        year_counts.index,
-                        year_counts.values,
-                        color="steelblue",
-                        edgecolor="black",
+                    plot_research_software_counts(
+                        year_counts,
+                        args.plot,
+                        args.start_year,
+                        args.end_year,
+                        args.y_scale,
                     )
-                    ax.set_xlabel("Year", fontsize=12)
-                    ax.set_ylabel("Number of new software products", fontsize=12)
-
-                    # Dynamic title with year range and subtitle with generation date
-                    title_text = f"New Research Software Products per year of publication {args.start_year}-{args.end_year}"
-                    subtitle_text = f"source: OpenAIRE API, retrieved on {datetime.now().strftime('%Y-%m-%d')}"
-                    ax.set_title(
-                        f"{title_text}\n{subtitle_text}", fontsize=12, fontweight="bold"
-                    )
-
-                    ax.grid(axis="y", alpha=0.3, linestyle="--")
-
-                    # Add value labels at top of bars for recent years
-                    recent_years = year_counts[
-                        year_counts.index >= year_counts.index.max() - 10
-                    ]
-                    for year, count in recent_years.items():
-                        ax.text(
-                            year,
-                            count,
-                            str(count),
-                            ha="center",
-                            va="bottom",
-                            fontsize=8,
-                        )
-
-                    plt.tight_layout()
-                    plt.savefig(args.plot, dpi=300, bbox_inches="tight")
-                    plt.close()
                     logger.info(f"✓ Plot saved to {args.plot}")
                 except Exception as plot_error:
                     logger.error(f"\n❌ Error generating plot: {plot_error}")
@@ -482,21 +565,28 @@ Examples:
         logger.info(f"\n{'=' * 60}")
         logger.info("=== Summary ===")
         logger.info(f"{'=' * 60}")
-        logger.info(f"Total software: {len(df)}")
+        if args.counts_only:
+            logger.info(f"Total research software records: {df['count'].sum()}")
+        else:
+            logger.info(f"Total research software records: {len(df)}")
 
         # By year
         logger.info("\nBy year:")
-        year_counts = df.groupby("year").size().sort_index()
+        if args.counts_only:
+            year_counts = df.set_index("year")["count"].sort_index()
+        else:
+            year_counts = df.groupby("year").size().sort_index()
         for year, count in year_counts.items():
             logger.info(f"  {year}: {count}")
 
         # By month (for recent years)
-        logger.info("\nBy year-month (last 3 years):")
-        recent_df = df[df["year"] >= 2021]
-        if len(recent_df) > 0:
-            month_counts = recent_df.groupby("year_month").size().sort_index()
-            for ym, count in month_counts.items():
-                logger.info(f"  {ym}: {count}")
+        if not args.counts_only:
+            logger.info("\nBy year-month (last 3 years):")
+            recent_df = df[df["year"] >= 2021]
+            if len(recent_df) > 0:
+                month_counts = recent_df.groupby("year_month").size().sort_index()
+                for ym, count in month_counts.items():
+                    logger.info(f"  {ym}: {count}")
 
     except KeyboardInterrupt:
         logger.warning("\n⚠️  Script interrupted by user")
