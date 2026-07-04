@@ -3,6 +3,7 @@ import time
 import traceback
 import logging
 import os
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from requests_cache import CachedSession
 from calendar import monthrange
@@ -40,7 +41,101 @@ logger.info(f"Requests cache enabled: openaire_cache.sqlite")
 # OpenAIRE documents research software as research products with type=software.
 OPENAIRE_RESEARCH_PRODUCTS_URL = "https://api.openaire.eu/graph/v2/researchProducts"
 RESEARCH_SOFTWARE_TYPE = "software"
+# OpenAIRE currently rejects larger page sizes with "Page size must be at most 100".
 PAGE_SIZE = 100
+# OpenAIRE public API limits: 60 requests/hour unauthenticated, 7200/hour authenticated.
+UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS = 61.0
+AUTHENTICATED_REQUEST_INTERVAL_SECONDS = 0.5
+OPENAIRE_API_TOKEN = os.environ.get("OPENAIRE_API_TOKEN")
+
+
+def get_request_interval_seconds():
+    """Return the configured delay between uncached OpenAIRE API requests."""
+    authenticated_default = AUTHENTICATED_REQUEST_INTERVAL_SECONDS
+    unauthenticated_default = UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS
+    default_interval = (
+        authenticated_default if OPENAIRE_API_TOKEN else unauthenticated_default
+    )
+    configured_interval = os.environ.get("OPENAIRE_REQUEST_INTERVAL_SECONDS")
+    if configured_interval is None:
+        return default_interval
+
+    try:
+        interval = float(configured_interval)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid OPENAIRE_REQUEST_INTERVAL_SECONDS=%r; using %.1fs",
+            configured_interval,
+            default_interval,
+        )
+        return default_interval
+
+    if interval < 0:
+        logger.warning(
+            "Ignoring negative OPENAIRE_REQUEST_INTERVAL_SECONDS=%r; using %.1fs",
+            configured_interval,
+            default_interval,
+        )
+        return default_interval
+
+    return interval
+
+
+if OPENAIRE_API_TOKEN:
+    session.headers.update({"Authorization": f"Bearer {OPENAIRE_API_TOKEN}"})
+    logger.info(
+        "OpenAIRE API token detected; using authenticated requests and %.1fs default throttle",
+        AUTHENTICATED_REQUEST_INTERVAL_SECONDS,
+    )
+else:
+    logger.info(
+        "No OPENAIRE_API_TOKEN set; uncached API calls will be throttled to %.1fs",
+        UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS,
+    )
+
+REQUEST_INTERVAL_SECONDS = get_request_interval_seconds()
+logger.info(
+    "OpenAIRE request interval for uncached responses: %.1fs",
+    REQUEST_INTERVAL_SECONDS,
+)
+
+
+def retry_after_seconds(response):
+    """Parse a Retry-After header as seconds, if present."""
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return None
+
+    try:
+        return max(float(retry_after), 0)
+    except ValueError:
+        try:
+            retry_after_dt = parsedate_to_datetime(retry_after)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    now = datetime.now(retry_after_dt.tzinfo)
+    return max((retry_after_dt - now).total_seconds(), 0)
+
+
+def retry_wait_seconds(error, retry_count):
+    """Choose a retry delay, respecting OpenAIRE rate-limit responses."""
+    response = getattr(error, "response", None)
+    if response is not None and response.status_code == 429:
+        wait_time = retry_after_seconds(response)
+        if wait_time is not None:
+            return wait_time
+        return max(REQUEST_INTERVAL_SECONDS, UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS)
+
+    return 2**retry_count
+
+
+def sleep_after_live_response(response):
+    """Throttle only real API calls; cached responses do not count against the API limit."""
+    if getattr(response, "from_cache", False):
+        return
+    if REQUEST_INTERVAL_SECONDS > 0:
+        time.sleep(REQUEST_INTERVAL_SECONDS)
 
 
 def first_value(value):
@@ -81,12 +176,11 @@ def fetch_research_software_for_period(
 ):
     """
     Fetch research software for a specific publication-date period.
-    Returns (period_count, hit_limit, new_cache_hits, new_cache_misses).
+    Returns (period_count, new_cache_hits, new_cache_misses).
     """
     logger.info(f"  Processing {from_date} to {to_date}")
     period_count = 0
     cursor = "*"
-    hit_limit = False
 
     while True:
         params = {
@@ -111,12 +205,13 @@ def fetch_research_software_for_period(
                     OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30
                 )
 
-                if response.from_cache:
+                if getattr(response, "from_cache", False):
                     cache_hits += 1
                 else:
                     cache_misses += 1
 
                 response.raise_for_status()
+                sleep_after_live_response(response)
                 data = response.json()
 
                 results = data.get("results", [])
@@ -181,9 +276,9 @@ def fetch_research_software_for_period(
 
                 retry_count += 1
                 if retry_count < max_retries and retry_on_error:
-                    wait_time = 2**retry_count
+                    wait_time = retry_wait_seconds(e, retry_count)
                     logger.info(
-                        f"Retrying in {wait_time} seconds... ({retry_count}/{max_retries})"
+                        f"Retrying in {wait_time:.1f} seconds... ({retry_count}/{max_retries})"
                     )
                     time.sleep(wait_time)
                 else:
@@ -193,89 +288,6 @@ def fetch_research_software_for_period(
 
         if not success or not has_results:
             break
-
-        try:
-            if not response.from_cache:
-                time.sleep(0.5)
-        except NameError:
-            # response might not be defined if we broke from the loop early
-            pass
-
-    return period_count, hit_limit, cache_hits, cache_misses
-
-
-def fetch_with_fallback(
-    from_date,
-    to_date,
-    year,
-    month,
-    all_software,
-    cache_hits,
-    cache_misses,
-    max_depth=5,
-    current_depth=0,
-):
-    """
-    Recursively fetch research software for a date period, splitting if needed.
-    """
-    if current_depth >= max_depth:
-        logger.error(
-            f"    Maximum depth reached for {from_date} to {to_date}. Some data may be missing."
-        )
-        return 0, cache_hits, cache_misses
-
-    period_count, hit_limit, cache_hits, cache_misses = (
-        fetch_research_software_for_period(
-            from_date, to_date, year, month, all_software, cache_hits, cache_misses
-        )
-    )
-
-    if hit_limit:
-        # Split the period in two and retry
-        logger.info(
-            f"    Splitting period {from_date} to {to_date} in half (depth {current_depth + 1})"
-        )
-
-        # Parse dates
-        from_dt = datetime.strptime(from_date, "%Y-%m-%d")
-        to_dt = datetime.strptime(to_date, "%Y-%m-%d")
-
-        # Calculate mid point
-        delta = to_dt - from_dt
-        mid_dt = from_dt + delta / 2
-
-        # First half (from_date to mid_date)
-        mid_date = mid_dt.strftime("%Y-%m-%d")
-        logger.info(f"    First half: {from_date} to {mid_date}")
-        count1, cache_hits, cache_misses = fetch_with_fallback(
-            from_date,
-            mid_date,
-            year,
-            month,
-            all_software,
-            cache_hits,
-            cache_misses,
-            max_depth,
-            current_depth + 1,
-        )
-
-        # Second half (mid_date to to_date) - note: API uses inclusive ranges
-        # To avoid duplicates, we might need to adjust. But the API filters by date accepted
-        # and splitting at midnight should naturally separate the data.
-        logger.info(f"    Second half: {mid_date} to {to_date}")
-        count2, cache_hits, cache_misses = fetch_with_fallback(
-            mid_date,
-            to_date,
-            year,
-            month,
-            all_software,
-            cache_hits,
-            cache_misses,
-            max_depth,
-            current_depth + 1,
-        )
-
-        period_count = count1 + count2
 
     return period_count, cache_hits, cache_misses
 
@@ -305,7 +317,7 @@ def get_openaire_software_by_month(
                 f"\n=== Processing {year}-{month:02d} ({from_date} to {to_date}) ==="
             )
 
-            month_count, _, cache_hits, cache_misses = fetch_research_software_for_period(
+            month_count, cache_hits, cache_misses = fetch_research_software_for_period(
                 from_date,
                 to_date,
                 year,
@@ -342,7 +354,9 @@ def get_openaire_software_by_month(
     return pd.DataFrame(all_software)
 
 
-def fetch_research_software_count_for_year(year, cache_hits, cache_misses):
+def fetch_research_software_count_for_year(
+    year, cache_hits, cache_misses, retry_on_error=True, max_retries=3
+):
     """Fetch the OpenAIRE count of research software records for one year."""
     params = {
         "page": 1,
@@ -352,18 +366,33 @@ def fetch_research_software_count_for_year(year, cache_hits, cache_misses):
         "toPublicationDate": f"{year}-12-31",
     }
 
-    response = session.get(OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30)
-    if response.from_cache:
-        cache_hits += 1
-    else:
-        cache_misses += 1
+    retry_count = 0
+    while True:
+        try:
+            response = session.get(
+                OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30
+            )
+            if getattr(response, "from_cache", False):
+                cache_hits += 1
+            else:
+                cache_misses += 1
 
-    response.raise_for_status()
+            response.raise_for_status()
+            sleep_after_live_response(response)
+            break
+        except Exception as e:
+            retry_count += 1
+            if retry_count < max_retries and retry_on_error:
+                wait_time = retry_wait_seconds(e, retry_count)
+                logger.info(
+                    f"Retrying count request for {year} in {wait_time:.1f} seconds... ({retry_count}/{max_retries})"
+                )
+                time.sleep(wait_time)
+            else:
+                raise
+
     data = response.json()
     count = data.get("header", {}).get("numFound", 0)
-
-    if not response.from_cache:
-        time.sleep(0.5)
 
     return int(count), cache_hits, cache_misses
 
@@ -607,6 +636,7 @@ Examples:
             )
             df_partial.to_csv(emergency_file, index=False)
             logger.info(f"Partial results saved to {emergency_file}")
+        sys.exit(130)
 
     except Exception as e:
         logger.error("\n❌ Fatal error in main execution:")
@@ -620,3 +650,4 @@ Examples:
             )
             df_partial.to_csv(emergency_file, index=False)
             logger.info(f"Partial results saved to {emergency_file}")
+        sys.exit(1)

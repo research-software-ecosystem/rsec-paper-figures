@@ -12,6 +12,7 @@ The `openaire.py` script fetches research software metadata from the OpenAIRE Gr
 - **Collects** software title, publication year/month, URL, and persistent identifier (PID)
 - **Implements caching** via `requests-cache` to store API responses in an SQLite database, reducing redundant API calls on re-runs
 - **Handles errors gracefully** with automatic retries, exponential backoff, and cursor-based paging
+- **Respects OpenAIRE request limits** by using the documented maximum `pageSize=100`, cursor paging for result sets above the 10,000-record offset-paging limit, and conservative throttling for uncached API calls
 - **Saves checkpoints** after processing each year, allowing resumption if interrupted
 - **Generates a bar plot** showing research software records by publication year (when `--plot` is specified)
 
@@ -33,9 +34,14 @@ python openaire.py --counts-only -o openaire_research_software_counts.csv -p ope
 # Generate a log-scale variant of the publication-year figure
 python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_per_year_log.png --y-scale log
 
+# Use an OpenAIRE personal access token for the higher authenticated request limit
+OPENAIRE_API_TOKEN=your_token python openaire.py --counts-only
+
 # Clear the API cache
 python openaire.py --clear-cache
 ```
+
+By default, uncached unauthenticated OpenAIRE requests are throttled to one request every 61 seconds, matching the public limit of 60 requests/hour. If `OPENAIRE_API_TOKEN` is set, requests use `Authorization: Bearer ...` and default to a 0.5 second interval, matching the authenticated limit of 7,200 requests/hour. The interval can be overridden with `OPENAIRE_REQUEST_INTERVAL_SECONDS`.
 
 ### Output
 
