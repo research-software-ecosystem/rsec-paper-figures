@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import time
 import traceback
 import logging
@@ -9,10 +10,27 @@ from requests_cache import CachedSession
 from calendar import monthrange
 
 try:
-    import matplotlib.pyplot as plt
-    import matplotlib
+    from plotnine import (
+        aes,
+        element_blank,
+        element_line,
+        element_rect,
+        element_text,
+        geom_col,
+        geom_line,
+        geom_point,
+        geom_text,
+        ggplot,
+        labs,
+        scale_color_manual,
+        scale_fill_manual,
+        scale_x_continuous,
+        scale_y_continuous,
+        scale_y_symlog,
+        theme,
+        theme_minimal,
+    )
 
-    matplotlib.use("Agg")  # Use non-interactive backend
     PLOTTING_AVAILABLE = True
 except ImportError:
     PLOTTING_AVAILABLE = False
@@ -41,6 +59,7 @@ logger.info(f"Requests cache enabled: openaire_cache.sqlite")
 # OpenAIRE documents research software as research products with type=software.
 OPENAIRE_RESEARCH_PRODUCTS_URL = "https://api.openaire.eu/graph/v2/researchProducts"
 RESEARCH_SOFTWARE_TYPE = "software"
+PLOT_HIGHLIGHT_START_YEAR = 2014
 # OpenAIRE currently rejects larger page sizes with "Page size must be at most 100".
 PAGE_SIZE = 100
 # OpenAIRE public API limits: 60 requests/hour unauthenticated, 7200/hour authenticated.
@@ -420,48 +439,260 @@ def get_openaire_research_software_counts_by_year(start_year=2000, end_year=2024
     return pd.DataFrame(rows)
 
 
-def plot_research_software_counts(
-    year_counts, plot_file, start_year, end_year, y_scale="linear"
-):
-    """Generate the OpenAIRE research software publication-year count plot."""
-    fig, ax = plt.subplots(figsize=(12, 10))
-    ax.bar(
-        year_counts.index,
-        year_counts.values,
-        color="steelblue",
-        edgecolor="black",
+def format_count_labels(values):
+    """Format y-axis count labels with thousands separators."""
+    labels = []
+    for value in values:
+        if pd.isna(value):
+            labels.append("")
+            continue
+
+        rounded_value = round(float(value))
+        if abs(rounded_value) >= 1000:
+            labels.append(f"{rounded_value:,.0f}")
+        else:
+            labels.append(f"{rounded_value:.0f}")
+    return labels
+
+
+def make_plot_dataframe(year_counts, y_scale):
+    """Return plotting data with visual grouping and sparse direct labels."""
+    plot_df = year_counts.rename_axis("year").reset_index(name="count")
+    plot_df["year"] = plot_df["year"].astype(int)
+    plot_df["count"] = plot_df["count"].astype(int)
+
+    current_year = datetime.now().year
+    current_year_label = f"{current_year} to date"
+    before_highlight_label = f"Before {PLOT_HIGHLIGHT_START_YEAR}"
+    highlight_label = f"{PLOT_HIGHLIGHT_START_YEAR} onward"
+    categories = [before_highlight_label, highlight_label]
+
+    def period_for_year(year):
+        if year == current_year:
+            return current_year_label
+        if year < PLOT_HIGHLIGHT_START_YEAR:
+            return before_highlight_label
+        return highlight_label
+
+    plot_df["period"] = plot_df["year"].apply(period_for_year)
+    if current_year_label in plot_df["period"].values:
+        categories.append(current_year_label)
+    plot_df["period"] = pd.Categorical(
+        plot_df["period"], categories=categories, ordered=True
     )
-    ax.set_xlabel("Year", fontsize=12)
-    ax.set_ylabel("Number of research software records", fontsize=12)
+
+    max_count = max(plot_df["count"].max(), 1)
+    label_df = plot_df[(plot_df["year"] % 5 == 0) & (plot_df["count"] > 0)].copy()
+    label_df["label"] = label_df["count"].map(lambda count: f"{count:,}")
     if y_scale == "log":
-        ax.set_yscale("symlog", linthresh=1)
+        label_df["label_y"] = label_df["count"] * 1.2
+    else:
+        label_df["label_y"] = label_df["count"] + max_count * 0.018
 
-    title_text = (
-        f"Research Software Records by publication year {start_year}-{end_year}"
-    )
-    if y_scale == "log":
-        title_text = f"{title_text} (log-scale y axis)"
-    subtitle_text = (
-        f"source: OpenAIRE Graph API, retrieved on {datetime.now().strftime('%Y-%m-%d')}"
-    )
-    ax.set_title(f"{title_text}\n{subtitle_text}", fontsize=12, fontweight="bold")
+    return plot_df, label_df
 
-    ax.grid(axis="y", alpha=0.3, linestyle="--")
 
-    decade_years = year_counts[(year_counts.index % 10 == 0) & (year_counts > 0)]
-    for year, count in decade_years.items():
-        ax.text(
-            year,
-            count,
-            str(count),
-            ha="center",
-            va="bottom",
-            fontsize=8,
+def fit_exponential_counts(year_counts, fit_start_year, fit_end_year):
+    """Fit count = a * exp(b * (year - fit_start_year)) on positive counts."""
+    fit_counts = year_counts.loc[fit_start_year:fit_end_year]
+    fit_counts = fit_counts[fit_counts > 0]
+    if len(fit_counts) < 2:
+        raise ValueError(
+            "At least two positive annual counts are required for an exponential fit"
         )
 
-    plt.tight_layout()
-    plt.savefig(plot_file, dpi=300, bbox_inches="tight")
-    plt.close()
+    years_since_start = fit_counts.index.to_numpy(dtype=float) - fit_start_year
+    log_counts = np.log(fit_counts.to_numpy(dtype=float))
+    slope, intercept = np.polyfit(years_since_start, log_counts, 1)
+    fitted_logs = intercept + slope * years_since_start
+
+    residual_sum_squares = np.sum((log_counts - fitted_logs) ** 2)
+    total_sum_squares = np.sum((log_counts - log_counts.mean()) ** 2)
+    r_squared = 1 - residual_sum_squares / total_sum_squares
+
+    fit_years = np.arange(fit_start_year, fit_end_year + 1)
+    fit_df = pd.DataFrame({"year": fit_years})
+    fit_df["fit_count"] = np.exp(intercept + slope * (fit_years - fit_start_year))
+    fit_df["series"] = f"Exponential fit {fit_start_year}-{fit_end_year}"
+
+    stats = {
+        "fit_start_year": fit_start_year,
+        "fit_end_year": fit_end_year,
+        "intercept_count": float(np.exp(intercept)),
+        "slope": float(slope),
+        "annual_factor": float(np.exp(slope)),
+        "annual_growth_percent": float((np.exp(slope) - 1) * 100),
+        "doubling_time_years": float(np.log(2) / slope),
+        "r_squared": float(r_squared),
+        "series": fit_df["series"].iloc[0],
+    }
+
+    return fit_df, stats
+
+
+def default_fit_end_year(end_year):
+    """Avoid fitting the current year, because it is usually incomplete."""
+    current_year = datetime.now().year
+    if end_year >= current_year:
+        return end_year - 1
+    return end_year
+
+
+def plot_research_software_counts(
+    year_counts,
+    plot_file,
+    start_year,
+    end_year,
+    y_scale="linear",
+    fit_start_year=None,
+    fit_end_year=None,
+):
+    """Generate the OpenAIRE research software publication-year count plot."""
+    if year_counts.empty:
+        raise ValueError("Cannot generate a plot from an empty year count series")
+
+    plot_df, label_df = make_plot_dataframe(year_counts, y_scale)
+    max_count = max(plot_df["count"].max(), 1)
+    fit_df = None
+    fit_stats = None
+    visible_max = max_count
+    if fit_start_year is not None:
+        if fit_end_year is None:
+            fit_end_year = default_fit_end_year(end_year)
+        fit_df, fit_stats = fit_exponential_counts(
+            year_counts, fit_start_year, fit_end_year
+        )
+        visible_max = max(visible_max, fit_df["fit_count"].max())
+
+    label_upper_limit = (
+        label_df["label_y"].max() * 1.08 if not label_df.empty else max_count
+    )
+
+    y_upper_limit = max(visible_max * 1.18, label_upper_limit)
+    x_break_start = (start_year // 5) * 5
+    x_breaks = [
+        year
+        for year in range(x_break_start, end_year + 1, 5)
+        if start_year <= year <= end_year
+    ]
+    if x_breaks and end_year not in x_breaks and end_year - x_breaks[-1] < 3:
+        x_breaks = x_breaks[:-1]
+    x_breaks = sorted(set([start_year, end_year, *x_breaks]))
+
+    title_text = "OpenAIRE research software records by publication year"
+    subtitle_text = (
+        f"Annual records from the OpenAIRE Graph API, {start_year}-{end_year}"
+    )
+    if y_scale == "log":
+        subtitle_text = f"{subtitle_text}; symmetric log y-axis"
+    if fit_stats is not None:
+        subtitle_text = (
+            f"{subtitle_text}; exponential fit "
+            f"{fit_stats['fit_start_year']}-{fit_stats['fit_end_year']}"
+        )
+
+    y_scale_layer = (
+        scale_y_symlog(
+            breaks=[1, 10, 100, 1000, 10000, 100000],
+            labels=format_count_labels,
+            limits=(0, y_upper_limit),
+            expand=(0.02, 0),
+        )
+        if y_scale == "log"
+        else scale_y_continuous(
+            labels=format_count_labels,
+            limits=(0, y_upper_limit),
+            expand=(0, 0),
+        )
+    )
+
+    period_colors = {
+        f"Before {PLOT_HIGHLIGHT_START_YEAR}": "#9CA3AF",
+        f"{PLOT_HIGHLIGHT_START_YEAR} onward": "#2A9D8F",
+        f"{datetime.now().year} to date": "#E76F51",
+    }
+    active_periods = [
+        period
+        for period in plot_df["period"].cat.categories
+        if period in plot_df["period"].values
+    ]
+
+    plot = (
+        ggplot(plot_df, aes(x="year", y="count", fill="period"))
+        + geom_col(width=0.82, color="#FFFFFF", size=0.3)
+        + geom_text(
+            data=label_df,
+            mapping=aes(y="label_y", label="label"),
+            size=7,
+            color="#22313F",
+            va="bottom",
+            show_legend=False,
+        )
+        + scale_fill_manual(
+            values=period_colors,
+            breaks=active_periods,
+            name="",
+        )
+        + scale_x_continuous(
+            breaks=x_breaks,
+            limits=(start_year - 0.6, end_year + 1.2),
+            expand=(0, 0),
+        )
+        + y_scale_layer
+        + labs(
+            title=title_text,
+            subtitle=subtitle_text,
+            x="Publication year",
+            y="Number of records",
+            caption=f"Source: OpenAIRE Graph API. Retrieved {datetime.now():%Y-%m-%d}.",
+        )
+        + theme_minimal(base_size=12, base_family="DejaVu Sans")
+        + theme(
+            figure_size=(12, 8),
+            dpi=300,
+            svg_usefonts=False,
+            plot_background=element_rect(fill="#FFFFFF", color="#FFFFFF"),
+            panel_background=element_rect(fill="#FFFFFF", color="#FFFFFF"),
+            panel_grid_major_x=element_blank(),
+            panel_grid_minor=element_blank(),
+            panel_grid_major_y=element_line(color="#D8DEE4", size=0.45),
+            axis_text_x=element_text(rotation=35, ha="right"),
+            axis_title_x=element_text(margin={"t": 10}),
+            axis_title_y=element_text(margin={"r": 10}),
+            plot_title=element_text(
+                size=17, weight="bold", color="#1F2933", ha="center"
+            ),
+            plot_subtitle=element_text(size=11, color="#52616B", ha="center"),
+            plot_caption=element_text(size=9, color="#6B7280", ha="center"),
+            legend_position="top",
+            legend_title=element_blank(),
+            legend_background=element_blank(),
+            legend_key=element_blank(),
+        )
+    )
+    if fit_df is not None:
+        plot = (
+            plot
+            + geom_line(
+                data=fit_df,
+                mapping=aes(x="year", y="fit_count", color="series"),
+                inherit_aes=False,
+                size=1.25,
+            )
+            + geom_point(
+                data=fit_df,
+                mapping=aes(x="year", y="fit_count", color="series"),
+                inherit_aes=False,
+                size=2.5,
+            )
+            + scale_color_manual(
+                values={fit_stats["series"]: "#D1495B"},
+                breaks=[fit_stats["series"]],
+                name="",
+            )
+        )
+
+    plot.save(plot_file, width=12, height=8, dpi=300, verbose=False)
 
 
 if __name__ == "__main__":
@@ -480,6 +711,7 @@ Examples:
   python openaire.py -s 2010 -e 2020    # Custom range
   python openaire.py -o results.csv     # Custom output CSV file
   python openaire.py -p plot.png        # Generate a plot of research software per year
+  python openaire.py --counts-only -p fit.png --y-scale log --exponential-fit-start-year 2014 --exponential-fit-end-year 2025
   python openaire.py --clear-cache      # Clear the API cache and exit
         """,
     )
@@ -524,6 +756,18 @@ Examples:
         choices=["linear", "log"],
         default="linear",
         help="Y-axis scale for generated plots (default: linear). The log option uses a symmetric log scale so zero-count years remain visible.",
+    )
+    parser.add_argument(
+        "--exponential-fit-start-year",
+        type=int,
+        default=None,
+        help="Overlay an exponential fit from this year. By default the fit ends at the last complete year.",
+    )
+    parser.add_argument(
+        "--exponential-fit-end-year",
+        type=int,
+        default=None,
+        help="End year for the exponential fit overlay (default: last complete year).",
     )
 
     args = parser.parse_args()
@@ -576,8 +820,8 @@ Examples:
         # Generate plot if requested
         if args.plot:
             if not PLOTTING_AVAILABLE:
-                logger.warning("\n⚠️  Cannot generate plot: matplotlib is not installed")
-                logger.info("Install it with: pip install matplotlib")
+                logger.warning("\n⚠️  Cannot generate plot: plotnine is not installed")
+                logger.info("Install it with: pip install plotnine")
             else:
                 try:
                     logger.info(f"\nGenerating plot: {args.plot}")
@@ -592,6 +836,8 @@ Examples:
                         args.start_year,
                         args.end_year,
                         args.y_scale,
+                        fit_start_year=args.exponential_fit_start_year,
+                        fit_end_year=args.exponential_fit_end_year,
                     )
                     logger.info(f"✓ Plot saved to {args.plot}")
                 except Exception as plot_error:

@@ -14,7 +14,7 @@ The `openaire.py` script fetches research software metadata from the OpenAIRE Gr
 - **Handles errors gracefully** with automatic retries, exponential backoff, and cursor-based paging
 - **Respects OpenAIRE request limits** by using the documented maximum `pageSize=100`, cursor paging for result sets above the 10,000-record offset-paging limit, and conservative throttling for uncached API calls
 - **Saves checkpoints** after processing each year, allowing resumption if interrupted
-- **Generates a bar plot** showing research software records by publication year (when `--plot` is specified)
+- **Generates a Plotnine bar plot** showing research software records by publication year (when `--plot` is specified)
 
 ### Usage
 
@@ -34,6 +34,9 @@ python openaire.py --counts-only -o openaire_research_software_counts.csv -p ope
 # Generate a log-scale variant of the publication-year figure
 python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_per_year_log.png --y-scale log
 
+# Generate a log-scale variant with an exponential fit overlay
+python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_exponential_fit_2014_2025.png --y-scale log --exponential-fit-start-year 2014 --exponential-fit-end-year 2025
+
 # Use an OpenAIRE personal access token for the higher authenticated request limit
 OPENAIRE_API_TOKEN=your_token python openaire.py --counts-only
 
@@ -48,7 +51,7 @@ By default, uncached unauthenticated OpenAIRE requests are throttled to one requ
 - `openaire_software_complete.csv` (or custom `-o` filename): CSV with columns `title`, `year`, `month`, `year_month`, `url`, `pid`
 - `openaire_research_software_counts.csv` when `--counts-only` is used: CSV with columns `year`, `count`
 - `openaire_cache.sqlite`: Cached API responses
-- Optional PNG plot showing research software records by publication year
+- Optional PNG or SVG Plotnine chart showing research software records by publication year
 - Log files with timestamped execution details
 
 ---
