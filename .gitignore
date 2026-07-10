@@ -38,14 +38,14 @@ htmlcov/
 *~
 
 # OpenAIRE scraper outputs
-openaire_software_*.csv
+# openaire_software_*.csv
 openaire_cache.sqlite
 openaire_scrape_*.log
 
 # Plots
 *.png
 *.pdf
-*.svg
+# *.svg
 
 # Jupyter notebooks
 .ipynb_checkpoints/

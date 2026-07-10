@@ -1,17 +1,36 @@
 import pandas as pd
+import numpy as np
 import time
 import traceback
 import logging
 import os
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from requests_cache import CachedSession
 from calendar import monthrange
 
 try:
-    import matplotlib.pyplot as plt
-    import matplotlib
+    from plotnine import (
+        aes,
+        element_blank,
+        element_line,
+        element_rect,
+        element_text,
+        geom_col,
+        geom_line,
+        geom_point,
+        geom_text,
+        ggplot,
+        labs,
+        scale_color_manual,
+        scale_fill_manual,
+        scale_x_continuous,
+        scale_y_continuous,
+        scale_y_symlog,
+        theme,
+        theme_minimal,
+    )
 
-    matplotlib.use("Agg")  # Use non-interactive backend
     PLOTTING_AVAILABLE = True
 except ImportError:
     PLOTTING_AVAILABLE = False
@@ -37,8 +56,133 @@ session = CachedSession(
 
 logger.info(f"Requests cache enabled: openaire_cache.sqlite")
 
+# OpenAIRE documents research software as research products with type=software.
+OPENAIRE_RESEARCH_PRODUCTS_URL = "https://api.openaire.eu/graph/v2/researchProducts"
+RESEARCH_SOFTWARE_TYPE = "software"
+PLOT_HIGHLIGHT_START_YEAR = 2014
+# OpenAIRE currently rejects larger page sizes with "Page size must be at most 100".
+PAGE_SIZE = 100
+# OpenAIRE public API limits: 60 requests/hour unauthenticated, 7200/hour authenticated.
+UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS = 61.0
+AUTHENTICATED_REQUEST_INTERVAL_SECONDS = 0.5
+OPENAIRE_API_TOKEN = os.environ.get("OPENAIRE_API_TOKEN")
 
-def fetch_software_for_period(
+
+def get_request_interval_seconds():
+    """Return the configured delay between uncached OpenAIRE API requests."""
+    authenticated_default = AUTHENTICATED_REQUEST_INTERVAL_SECONDS
+    unauthenticated_default = UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS
+    default_interval = (
+        authenticated_default if OPENAIRE_API_TOKEN else unauthenticated_default
+    )
+    configured_interval = os.environ.get("OPENAIRE_REQUEST_INTERVAL_SECONDS")
+    if configured_interval is None:
+        return default_interval
+
+    try:
+        interval = float(configured_interval)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid OPENAIRE_REQUEST_INTERVAL_SECONDS=%r; using %.1fs",
+            configured_interval,
+            default_interval,
+        )
+        return default_interval
+
+    if interval < 0:
+        logger.warning(
+            "Ignoring negative OPENAIRE_REQUEST_INTERVAL_SECONDS=%r; using %.1fs",
+            configured_interval,
+            default_interval,
+        )
+        return default_interval
+
+    return interval
+
+
+if OPENAIRE_API_TOKEN:
+    session.headers.update({"Authorization": f"Bearer {OPENAIRE_API_TOKEN}"})
+    logger.info(
+        "OpenAIRE API token detected; using authenticated requests and %.1fs default throttle",
+        AUTHENTICATED_REQUEST_INTERVAL_SECONDS,
+    )
+else:
+    logger.info(
+        "No OPENAIRE_API_TOKEN set; uncached API calls will be throttled to %.1fs",
+        UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS,
+    )
+
+REQUEST_INTERVAL_SECONDS = get_request_interval_seconds()
+logger.info(
+    "OpenAIRE request interval for uncached responses: %.1fs",
+    REQUEST_INTERVAL_SECONDS,
+)
+
+
+def retry_after_seconds(response):
+    """Parse a Retry-After header as seconds, if present."""
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return None
+
+    try:
+        return max(float(retry_after), 0)
+    except ValueError:
+        try:
+            retry_after_dt = parsedate_to_datetime(retry_after)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    now = datetime.now(retry_after_dt.tzinfo)
+    return max((retry_after_dt - now).total_seconds(), 0)
+
+
+def retry_wait_seconds(error, retry_count):
+    """Choose a retry delay, respecting OpenAIRE rate-limit responses."""
+    response = getattr(error, "response", None)
+    if response is not None and response.status_code == 429:
+        wait_time = retry_after_seconds(response)
+        if wait_time is not None:
+            return wait_time
+        return max(REQUEST_INTERVAL_SECONDS, UNAUTHENTICATED_REQUEST_INTERVAL_SECONDS)
+
+    return 2**retry_count
+
+
+def sleep_after_live_response(response):
+    """Throttle only real API calls; cached responses do not count against the API limit."""
+    if getattr(response, "from_cache", False):
+        return
+    if REQUEST_INTERVAL_SECONDS > 0:
+        time.sleep(REQUEST_INTERVAL_SECONDS)
+
+
+def first_value(value):
+    """Return a useful scalar from an OpenAIRE value that may be a list."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def get_research_software_url(item):
+    """Extract the most useful URL exposed by the Graph API response."""
+    code_repository_url = first_value(item.get("codeRepositoryUrl"))
+    if code_repository_url:
+        return code_repository_url
+
+    documentation_url = first_value(item.get("documentationUrls"))
+    if documentation_url:
+        return documentation_url
+
+    for instance in item.get("instances") or []:
+        url = first_value(instance.get("urls"))
+        if url:
+            return url
+
+    return None
+
+
+def fetch_research_software_for_period(
     from_date,
     to_date,
     year,
@@ -50,22 +194,20 @@ def fetch_software_for_period(
     max_retries=3,
 ):
     """
-    Fetch software for a specific date period.
-    Returns (period_count, hit_limit, new_cache_hits, new_cache_misses)
-    If hit_limit is True, it means we hit the 10k limit and need to split.
+    Fetch research software for a specific publication-date period.
+    Returns (period_count, new_cache_hits, new_cache_misses).
     """
     logger.info(f"  Processing {from_date} to {to_date}")
     period_count = 0
-    page = 1
-    hit_limit = False
+    cursor = "*"
 
     while True:
         params = {
-            "format": "json",
-            "size": 100,
-            "page": page,
-            "fromDateAccepted": from_date,
-            "toDateAccepted": to_date,
+            "pageSize": PAGE_SIZE,
+            "cursor": cursor,
+            "type": RESEARCH_SOFTWARE_TYPE,
+            "fromPublicationDate": from_date,
+            "toPublicationDate": to_date,
         }
 
         retry_count = 0
@@ -75,30 +217,23 @@ def fetch_software_for_period(
         while not success and retry_count < max_retries:
             try:
                 logger.debug(
-                    f"Requesting {from_date} to {to_date}, page {page}, attempt {retry_count + 1}"
+                    f"Requesting {from_date} to {to_date}, cursor {cursor}, attempt {retry_count + 1}"
                 )
 
                 response = session.get(
-                    "https://api.openaire.eu/search/software", params=params, timeout=30
+                    OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30
                 )
 
-                if response.from_cache:
+                if getattr(response, "from_cache", False):
                     cache_hits += 1
                 else:
                     cache_misses += 1
 
                 response.raise_for_status()
+                sleep_after_live_response(response)
                 data = response.json()
 
-                response_data = data.get("response", {})
-                results_data = response_data.get("results")
-
-                if results_data is None or not isinstance(results_data, dict):
-                    success = True
-                    has_results = False
-                    break
-
-                results = results_data.get("result", [])
+                results = data.get("results", [])
 
                 if not results or results is None:
                     success = True
@@ -109,35 +244,15 @@ def fetch_software_for_period(
 
                 for item in results:
                     try:
-                        metadata = (
-                            item.get("metadata", {})
-                            .get("oaf:entity", {})
-                            .get("oaf:result", {})
-                        )
-
-                        title_obj = metadata.get("title", {})
-                        if isinstance(title_obj, dict):
-                            title = title_obj.get("$", "N/A")
-                        elif isinstance(title_obj, list) and len(title_obj) > 0:
-                            title = (
-                                title_obj[0].get("$", "N/A")
-                                if isinstance(title_obj[0], dict)
-                                else "N/A"
+                        result_type = item.get("type")
+                        if result_type != RESEARCH_SOFTWARE_TYPE:
+                            logger.warning(
+                                f"Skipping non-software OpenAIRE result {item.get('id')}: type={result_type}"
                             )
-                        else:
-                            title = "N/A"
+                            continue
 
-                        url_obj = metadata.get("websiteurl", {})
-                        if isinstance(url_obj, dict):
-                            url = url_obj.get("$")
-                        elif isinstance(url_obj, list) and len(url_obj) > 0:
-                            url = (
-                                url_obj[0].get("$")
-                                if isinstance(url_obj[0], dict)
-                                else None
-                            )
-                        else:
-                            url = None
+                        title = item.get("mainTitle") or "N/A"
+                        url = get_research_software_url(item)
 
                         all_software.append(
                             {
@@ -146,47 +261,43 @@ def fetch_software_for_period(
                                 "month": month,
                                 "year_month": f"{year}-{month:02d}",
                                 "url": url,
-                                "pid": item.get("header", {}).get(
-                                    "dri:objIdentifier", "N/A"
-                                ),
+                                "pid": item.get("id", "N/A"),
                             }
                         )
                         period_count += 1
                     except Exception as item_error:
                         logger.error(
-                            f"Error processing individual item in {from_date}-{to_date}, page {page}"
+                            f"Error processing individual item in {from_date}-{to_date}, cursor {cursor}"
                         )
                         logger.error(f"Item error: {item_error}")
                         traceback.print_exc()
                         continue
 
                 logger.info(
-                    f"    Page {page}: +{len(results)} software (period total: {period_count})"
+                    f"    Cursor page: +{len(results)} research software records (period total: {period_count})"
                 )
 
-                # Check if we've hit the 10k limit
-                if page * 100 >= 10000:
-                    logger.warning(
-                        f"    ⚠️  Hit 10k limit for {from_date} to {to_date}!"
-                    )
-                    hit_limit = True
+                next_cursor = data.get("header", {}).get("nextCursor")
+                if not next_cursor or next_cursor == cursor:
                     success = True
                     has_results = False
                     break
 
+                cursor = next_cursor
+
                 success = True
 
             except Exception as e:
-                logger.error(f"\n❌ Error on {from_date}-{to_date}, page {page}:")
+                logger.error(f"\n❌ Error on {from_date}-{to_date}, cursor {cursor}:")
                 logger.error(f"Error type: {type(e).__name__}")
                 logger.error(f"Error message: {e}")
                 traceback.print_exc()
 
                 retry_count += 1
                 if retry_count < max_retries and retry_on_error:
-                    wait_time = 2**retry_count
+                    wait_time = retry_wait_seconds(e, retry_count)
                     logger.info(
-                        f"Retrying in {wait_time} seconds... ({retry_count}/{max_retries})"
+                        f"Retrying in {wait_time:.1f} seconds... ({retry_count}/{max_retries})"
                     )
                     time.sleep(wait_time)
                 else:
@@ -197,95 +308,13 @@ def fetch_software_for_period(
         if not success or not has_results:
             break
 
-        page += 1
-        try:
-            if not response.from_cache:
-                time.sleep(0.5)
-        except NameError:
-            # response might not be defined if we broke from the loop early
-            pass
-
-    return period_count, hit_limit, cache_hits, cache_misses
-
-
-def fetch_with_fallback(
-    from_date,
-    to_date,
-    year,
-    month,
-    all_software,
-    cache_hits,
-    cache_misses,
-    max_depth=5,
-    current_depth=0,
-):
-    """
-    Recursively fetch software for a date period, splitting if we hit the 10k limit.
-    """
-    if current_depth >= max_depth:
-        logger.error(
-            f"    Maximum depth reached for {from_date} to {to_date}. Some data may be missing."
-        )
-        return 0, cache_hits, cache_misses
-
-    period_count, hit_limit, cache_hits, cache_misses = fetch_software_for_period(
-        from_date, to_date, year, month, all_software, cache_hits, cache_misses
-    )
-
-    if hit_limit:
-        # Split the period in two and retry
-        logger.info(
-            f"    Splitting period {from_date} to {to_date} in half (depth {current_depth + 1})"
-        )
-
-        # Parse dates
-        from_dt = datetime.strptime(from_date, "%Y-%m-%d")
-        to_dt = datetime.strptime(to_date, "%Y-%m-%d")
-
-        # Calculate mid point
-        delta = to_dt - from_dt
-        mid_dt = from_dt + delta / 2
-
-        # First half (from_date to mid_date)
-        mid_date = mid_dt.strftime("%Y-%m-%d")
-        logger.info(f"    First half: {from_date} to {mid_date}")
-        count1, cache_hits, cache_misses = fetch_with_fallback(
-            from_date,
-            mid_date,
-            year,
-            month,
-            all_software,
-            cache_hits,
-            cache_misses,
-            max_depth,
-            current_depth + 1,
-        )
-
-        # Second half (mid_date to to_date) - note: API uses inclusive ranges
-        # To avoid duplicates, we might need to adjust. But the API filters by date accepted
-        # and splitting at midnight should naturally separate the data.
-        logger.info(f"    Second half: {mid_date} to {to_date}")
-        count2, cache_hits, cache_misses = fetch_with_fallback(
-            mid_date,
-            to_date,
-            year,
-            month,
-            all_software,
-            cache_hits,
-            cache_misses,
-            max_depth,
-            current_depth + 1,
-        )
-
-        period_count = count1 + count2
-
     return period_count, cache_hits, cache_misses
 
 
 def get_openaire_software_by_month(
     start_year=2000, end_year=2024, retry_on_error=True, max_retries=3
 ):
-    """Get software month by month to bypass the 10k limit"""
+    """Get OpenAIRE research software month by month."""
     all_software = []
     cache_hits = 0
     cache_misses = 0
@@ -307,12 +336,21 @@ def get_openaire_software_by_month(
                 f"\n=== Processing {year}-{month:02d} ({from_date} to {to_date}) ==="
             )
 
-            # Use the fetch_with_fallback function that automatically splits periods if 10k limit is hit
-            month_count, cache_hits, cache_misses = fetch_with_fallback(
-                from_date, to_date, year, month, all_software, cache_hits, cache_misses
+            month_count, cache_hits, cache_misses = fetch_research_software_for_period(
+                from_date,
+                to_date,
+                year,
+                month,
+                all_software,
+                cache_hits,
+                cache_misses,
+                retry_on_error=retry_on_error,
+                max_retries=max_retries,
             )
 
-            logger.info(f"Total for {year}-{month:02d}: {month_count} software")
+            logger.info(
+                f"Total for {year}-{month:02d}: {month_count} research software records"
+            )
 
         # Save checkpoint after each year
         if all_software:
@@ -335,13 +373,335 @@ def get_openaire_software_by_month(
     return pd.DataFrame(all_software)
 
 
+def fetch_research_software_count_for_year(
+    year, cache_hits, cache_misses, retry_on_error=True, max_retries=3
+):
+    """Fetch the OpenAIRE count of research software records for one year."""
+    params = {
+        "page": 1,
+        "pageSize": 1,
+        "type": RESEARCH_SOFTWARE_TYPE,
+        "fromPublicationDate": f"{year}-01-01",
+        "toPublicationDate": f"{year}-12-31",
+    }
+
+    retry_count = 0
+    while True:
+        try:
+            response = session.get(
+                OPENAIRE_RESEARCH_PRODUCTS_URL, params=params, timeout=30
+            )
+            if getattr(response, "from_cache", False):
+                cache_hits += 1
+            else:
+                cache_misses += 1
+
+            response.raise_for_status()
+            sleep_after_live_response(response)
+            break
+        except Exception as e:
+            retry_count += 1
+            if retry_count < max_retries and retry_on_error:
+                wait_time = retry_wait_seconds(e, retry_count)
+                logger.info(
+                    f"Retrying count request for {year} in {wait_time:.1f} seconds... ({retry_count}/{max_retries})"
+                )
+                time.sleep(wait_time)
+            else:
+                raise
+
+    data = response.json()
+    count = data.get("header", {}).get("numFound", 0)
+
+    return int(count), cache_hits, cache_misses
+
+
+def get_openaire_research_software_counts_by_year(start_year=2000, end_year=2024):
+    """Get annual OpenAIRE research software counts without downloading metadata."""
+    rows = []
+    cache_hits = 0
+    cache_misses = 0
+
+    for year in range(start_year, end_year + 1):
+        logger.info(f"Fetching research software count for {year}")
+        count, cache_hits, cache_misses = fetch_research_software_count_for_year(
+            year, cache_hits, cache_misses
+        )
+        rows.append({"year": year, "count": count})
+        logger.info(f"  {year}: {count}")
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info("=== Count Cache Statistics ===")
+    logger.info(f"{'=' * 60}")
+    logger.info(f"Cache hits: {cache_hits}")
+    logger.info(f"Cache misses (API calls): {cache_misses}")
+
+    return pd.DataFrame(rows)
+
+
+def format_count_labels(values):
+    """Format y-axis count labels with thousands separators."""
+    labels = []
+    for value in values:
+        if pd.isna(value):
+            labels.append("")
+            continue
+
+        rounded_value = round(float(value))
+        if abs(rounded_value) >= 1000:
+            labels.append(f"{rounded_value:,.0f}")
+        else:
+            labels.append(f"{rounded_value:.0f}")
+    return labels
+
+
+def make_plot_dataframe(year_counts, y_scale):
+    """Return plotting data with visual grouping and sparse direct labels."""
+    plot_df = year_counts.rename_axis("year").reset_index(name="count")
+    plot_df["year"] = plot_df["year"].astype(int)
+    plot_df["count"] = plot_df["count"].astype(int)
+
+    current_year = datetime.now().year
+    current_year_label = f"{current_year} to date"
+    before_highlight_label = f"Before {PLOT_HIGHLIGHT_START_YEAR}"
+    highlight_label = f"{PLOT_HIGHLIGHT_START_YEAR} onward"
+    categories = [before_highlight_label, highlight_label]
+
+    def period_for_year(year):
+        if year == current_year:
+            return current_year_label
+        if year < PLOT_HIGHLIGHT_START_YEAR:
+            return before_highlight_label
+        return highlight_label
+
+    plot_df["period"] = plot_df["year"].apply(period_for_year)
+    if current_year_label in plot_df["period"].values:
+        categories.append(current_year_label)
+    plot_df["period"] = pd.Categorical(
+        plot_df["period"], categories=categories, ordered=True
+    )
+
+    max_count = max(plot_df["count"].max(), 1)
+    label_df = plot_df[(plot_df["year"] % 5 == 0) & (plot_df["count"] > 0)].copy()
+    label_df["label"] = label_df["count"].map(lambda count: f"{count:,}")
+    if y_scale == "log":
+        label_df["label_y"] = label_df["count"] * 1.2
+    else:
+        label_df["label_y"] = label_df["count"] + max_count * 0.018
+
+    return plot_df, label_df
+
+
+def fit_exponential_counts(year_counts, fit_start_year, fit_end_year):
+    """Fit count = a * exp(b * (year - fit_start_year)) on positive counts."""
+    fit_counts = year_counts.loc[fit_start_year:fit_end_year]
+    fit_counts = fit_counts[fit_counts > 0]
+    if len(fit_counts) < 2:
+        raise ValueError(
+            "At least two positive annual counts are required for an exponential fit"
+        )
+
+    years_since_start = fit_counts.index.to_numpy(dtype=float) - fit_start_year
+    log_counts = np.log(fit_counts.to_numpy(dtype=float))
+    slope, intercept = np.polyfit(years_since_start, log_counts, 1)
+    fitted_logs = intercept + slope * years_since_start
+
+    residual_sum_squares = np.sum((log_counts - fitted_logs) ** 2)
+    total_sum_squares = np.sum((log_counts - log_counts.mean()) ** 2)
+    r_squared = 1 - residual_sum_squares / total_sum_squares
+
+    fit_years = np.arange(fit_start_year, fit_end_year + 1)
+    fit_df = pd.DataFrame({"year": fit_years})
+    fit_df["fit_count"] = np.exp(intercept + slope * (fit_years - fit_start_year))
+    fit_df["series"] = f"Exponential fit {fit_start_year}-{fit_end_year}"
+
+    stats = {
+        "fit_start_year": fit_start_year,
+        "fit_end_year": fit_end_year,
+        "intercept_count": float(np.exp(intercept)),
+        "slope": float(slope),
+        "annual_factor": float(np.exp(slope)),
+        "annual_growth_percent": float((np.exp(slope) - 1) * 100),
+        "doubling_time_years": float(np.log(2) / slope),
+        "r_squared": float(r_squared),
+        "series": fit_df["series"].iloc[0],
+    }
+
+    return fit_df, stats
+
+
+def default_fit_end_year(end_year):
+    """Avoid fitting the current year, because it is usually incomplete."""
+    current_year = datetime.now().year
+    if end_year >= current_year:
+        return end_year - 1
+    return end_year
+
+
+def plot_research_software_counts(
+    year_counts,
+    plot_file,
+    start_year,
+    end_year,
+    y_scale="linear",
+    fit_start_year=None,
+    fit_end_year=None,
+):
+    """Generate the OpenAIRE research software publication-year count plot."""
+    if year_counts.empty:
+        raise ValueError("Cannot generate a plot from an empty year count series")
+
+    plot_df, label_df = make_plot_dataframe(year_counts, y_scale)
+    max_count = max(plot_df["count"].max(), 1)
+    fit_df = None
+    fit_stats = None
+    visible_max = max_count
+    if fit_start_year is not None:
+        if fit_end_year is None:
+            fit_end_year = default_fit_end_year(end_year)
+        fit_df, fit_stats = fit_exponential_counts(
+            year_counts, fit_start_year, fit_end_year
+        )
+        visible_max = max(visible_max, fit_df["fit_count"].max())
+
+    label_upper_limit = (
+        label_df["label_y"].max() * 1.08 if not label_df.empty else max_count
+    )
+
+    y_upper_limit = max(visible_max * 1.18, label_upper_limit)
+    x_break_start = (start_year // 5) * 5
+    x_breaks = [
+        year
+        for year in range(x_break_start, end_year + 1, 5)
+        if start_year <= year <= end_year
+    ]
+    if x_breaks and end_year not in x_breaks and end_year - x_breaks[-1] < 3:
+        x_breaks = x_breaks[:-1]
+    x_breaks = sorted(set([start_year, end_year, *x_breaks]))
+
+    title_text = "OpenAIRE research software records by publication year"
+    subtitle_text = (
+        f"Annual records from the OpenAIRE Graph API, {start_year}-{end_year}"
+    )
+    if y_scale == "log":
+        subtitle_text = f"{subtitle_text}; symmetric log y-axis"
+    if fit_stats is not None:
+        subtitle_text = (
+            f"{subtitle_text}; exponential fit "
+            f"{fit_stats['fit_start_year']}-{fit_stats['fit_end_year']}"
+        )
+
+    y_scale_layer = (
+        scale_y_symlog(
+            breaks=[1, 10, 100, 1000, 10000, 100000],
+            labels=format_count_labels,
+            limits=(0, y_upper_limit),
+            expand=(0.02, 0),
+        )
+        if y_scale == "log"
+        else scale_y_continuous(
+            labels=format_count_labels,
+            limits=(0, y_upper_limit),
+            expand=(0, 0),
+        )
+    )
+
+    period_colors = {
+        f"Before {PLOT_HIGHLIGHT_START_YEAR}": "#9CA3AF",
+        f"{PLOT_HIGHLIGHT_START_YEAR} onward": "#2A9D8F",
+        f"{datetime.now().year} to date": "#E76F51",
+    }
+    active_periods = [
+        period
+        for period in plot_df["period"].cat.categories
+        if period in plot_df["period"].values
+    ]
+
+    plot = (
+        ggplot(plot_df, aes(x="year", y="count", fill="period"))
+        + geom_col(width=0.82, color="#FFFFFF", size=0.3)
+        + geom_text(
+            data=label_df,
+            mapping=aes(y="label_y", label="label"),
+            size=7,
+            color="#22313F",
+            va="bottom",
+            show_legend=False,
+        )
+        + scale_fill_manual(
+            values=period_colors,
+            breaks=active_periods,
+            name="",
+        )
+        + scale_x_continuous(
+            breaks=x_breaks,
+            limits=(start_year - 0.6, end_year + 1.2),
+            expand=(0, 0),
+        )
+        + y_scale_layer
+        + labs(
+            title=title_text,
+            subtitle=subtitle_text,
+            x="Publication year",
+            y="Number of records",
+            caption=f"Source: OpenAIRE Graph API. Retrieved {datetime.now():%Y-%m-%d}.",
+        )
+        + theme_minimal(base_size=12, base_family="DejaVu Sans")
+        + theme(
+            figure_size=(12, 8),
+            dpi=300,
+            svg_usefonts=False,
+            plot_background=element_rect(fill="#FFFFFF", color="#FFFFFF"),
+            panel_background=element_rect(fill="#FFFFFF", color="#FFFFFF"),
+            panel_grid_major_x=element_blank(),
+            panel_grid_minor=element_blank(),
+            panel_grid_major_y=element_line(color="#D8DEE4", size=0.45),
+            axis_text_x=element_text(rotation=35, ha="right"),
+            axis_title_x=element_text(margin={"t": 10}),
+            axis_title_y=element_text(margin={"r": 10}),
+            plot_title=element_text(
+                size=17, weight="bold", color="#1F2933", ha="center"
+            ),
+            plot_subtitle=element_text(size=11, color="#52616B", ha="center"),
+            plot_caption=element_text(size=9, color="#6B7280", ha="center"),
+            legend_position="top",
+            legend_title=element_blank(),
+            legend_background=element_blank(),
+            legend_key=element_blank(),
+        )
+    )
+    if fit_df is not None:
+        plot = (
+            plot
+            + geom_line(
+                data=fit_df,
+                mapping=aes(x="year", y="fit_count", color="series"),
+                inherit_aes=False,
+                size=1.25,
+            )
+            + geom_point(
+                data=fit_df,
+                mapping=aes(x="year", y="fit_count", color="series"),
+                inherit_aes=False,
+                size=2.5,
+            )
+            + scale_color_manual(
+                values={fit_stats["series"]: "#D1495B"},
+                breaks=[fit_stats["series"]],
+                name="",
+            )
+        )
+
+    plot.save(plot_file, width=12, height=8, dpi=300, verbose=False)
+
+
 if __name__ == "__main__":
     import sys
     import argparse
 
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Scrape software metadata from OpenAIRE API",
+        description="Scrape research software metadata from the OpenAIRE Graph API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -350,7 +710,8 @@ Examples:
   python openaire.py --end-year 2020    # End at year 2020
   python openaire.py -s 2010 -e 2020    # Custom range
   python openaire.py -o results.csv     # Custom output CSV file
-  python openaire.py -p plot.png        # Generate a plot of software per year
+  python openaire.py -p plot.png        # Generate a plot of research software per year
+  python openaire.py --counts-only -p fit.png --y-scale log --exponential-fit-start-year 2014 --exponential-fit-end-year 2025
   python openaire.py --clear-cache      # Clear the API cache and exit
         """,
     )
@@ -385,6 +746,29 @@ Examples:
         default=None,
         help="Output plot file name (e.g., software_per_year.png). If not specified, no plot is generated",
     )
+    parser.add_argument(
+        "--counts-only",
+        action="store_true",
+        help="Fetch annual OpenAIRE counts only, useful for generating the yearly figure without downloading all metadata",
+    )
+    parser.add_argument(
+        "--y-scale",
+        choices=["linear", "log"],
+        default="linear",
+        help="Y-axis scale for generated plots (default: linear). The log option uses a symmetric log scale so zero-count years remain visible.",
+    )
+    parser.add_argument(
+        "--exponential-fit-start-year",
+        type=int,
+        default=None,
+        help="Overlay an exponential fit from this year. By default the fit ends at the last complete year.",
+    )
+    parser.add_argument(
+        "--exponential-fit-end-year",
+        type=int,
+        default=None,
+        help="End year for the exponential fit overlay (default: last complete year).",
+    )
 
     args = parser.parse_args()
 
@@ -412,68 +796,49 @@ Examples:
         sys.exit(1)
 
     try:
-        logger.info("Starting OpenAIRE software scraping (MONTH BY MONTH)")
-        logger.info(
-            "This will make more API calls but avoid hitting limits per time period"
-        )
         logger.info(f"Year range: {args.start_year} to {args.end_year}")
-        print('A')
 
-        df = get_openaire_software_by_month(args.start_year, args.end_year)
-        print('B')
-        # Save to CSV
         output_file = args.output
-        df.to_csv(output_file, index=False)
-        logger.info(f"\n✓ Saved results to {output_file}")
-        print('C')
-        logger.info(args.plot)
-        print('D')
+
+        if args.counts_only:
+            logger.info("Starting OpenAIRE research software count retrieval")
+            logger.info("Using Graph API researchProducts with type=software")
+            df = get_openaire_research_software_counts_by_year(
+                args.start_year, args.end_year
+            )
+            df.to_csv(output_file, index=False)
+            logger.info(f"\n✓ Saved annual counts to {output_file}")
+        else:
+            logger.info("Starting OpenAIRE research software scraping (MONTH BY MONTH)")
+            logger.info(
+                "Using Graph API researchProducts with type=software and cursor paging"
+            )
+            df = get_openaire_software_by_month(args.start_year, args.end_year)
+            df.to_csv(output_file, index=False)
+            logger.info(f"\n✓ Saved results to {output_file}")
+
         # Generate plot if requested
         if args.plot:
             if not PLOTTING_AVAILABLE:
-                logger.warning("\n⚠️  Cannot generate plot: matplotlib is not installed")
-                logger.info("Install it with: pip install matplotlib")
+                logger.warning("\n⚠️  Cannot generate plot: plotnine is not installed")
+                logger.info("Install it with: pip install plotnine")
             else:
                 try:
                     logger.info(f"\nGenerating plot: {args.plot}")
-                    year_counts = df.groupby("year").size().sort_index()
+                    if args.counts_only:
+                        year_counts = df.set_index("year")["count"].sort_index()
+                    else:
+                        year_counts = df.groupby("year").size().sort_index()
 
-                    fig, ax = plt.subplots(figsize=(12, 10))
-                    ax.bar(
-                        year_counts.index,
-                        year_counts.values,
-                        color="steelblue",
-                        edgecolor="black",
+                    plot_research_software_counts(
+                        year_counts,
+                        args.plot,
+                        args.start_year,
+                        args.end_year,
+                        args.y_scale,
+                        fit_start_year=args.exponential_fit_start_year,
+                        fit_end_year=args.exponential_fit_end_year,
                     )
-                    ax.set_xlabel("Year", fontsize=12)
-                    ax.set_ylabel("Number of new software products", fontsize=12)
-
-                    # Dynamic title with year range and subtitle with generation date
-                    title_text = f"New Research Software Products per year of publication {args.start_year}-{args.end_year}"
-                    subtitle_text = f"source: OpenAIRE API, retrieved on {datetime.now().strftime('%Y-%m-%d')}"
-                    ax.set_title(
-                        f"{title_text}\n{subtitle_text}", fontsize=12, fontweight="bold"
-                    )
-
-                    ax.grid(axis="y", alpha=0.3, linestyle="--")
-
-                    # Add value labels at top of bars for recent years
-                    recent_years = year_counts[
-                        year_counts.index >= year_counts.index.max() - 10
-                    ]
-                    for year, count in recent_years.items():
-                        ax.text(
-                            year,
-                            count,
-                            str(count),
-                            ha="center",
-                            va="bottom",
-                            fontsize=8,
-                        )
-
-                    plt.tight_layout()
-                    plt.savefig(args.plot, dpi=300, bbox_inches="tight")
-                    plt.close()
                     logger.info(f"✓ Plot saved to {args.plot}")
                 except Exception as plot_error:
                     logger.error(f"\n❌ Error generating plot: {plot_error}")
@@ -482,21 +847,28 @@ Examples:
         logger.info(f"\n{'=' * 60}")
         logger.info("=== Summary ===")
         logger.info(f"{'=' * 60}")
-        logger.info(f"Total software: {len(df)}")
+        if args.counts_only:
+            logger.info(f"Total research software records: {df['count'].sum()}")
+        else:
+            logger.info(f"Total research software records: {len(df)}")
 
         # By year
         logger.info("\nBy year:")
-        year_counts = df.groupby("year").size().sort_index()
+        if args.counts_only:
+            year_counts = df.set_index("year")["count"].sort_index()
+        else:
+            year_counts = df.groupby("year").size().sort_index()
         for year, count in year_counts.items():
             logger.info(f"  {year}: {count}")
 
         # By month (for recent years)
-        logger.info("\nBy year-month (last 3 years):")
-        recent_df = df[df["year"] >= 2021]
-        if len(recent_df) > 0:
-            month_counts = recent_df.groupby("year_month").size().sort_index()
-            for ym, count in month_counts.items():
-                logger.info(f"  {ym}: {count}")
+        if not args.counts_only:
+            logger.info("\nBy year-month (last 3 years):")
+            recent_df = df[df["year"] >= 2021]
+            if len(recent_df) > 0:
+                month_counts = recent_df.groupby("year_month").size().sort_index()
+                for ym, count in month_counts.items():
+                    logger.info(f"  {ym}: {count}")
 
     except KeyboardInterrupt:
         logger.warning("\n⚠️  Script interrupted by user")
@@ -510,6 +882,7 @@ Examples:
             )
             df_partial.to_csv(emergency_file, index=False)
             logger.info(f"Partial results saved to {emergency_file}")
+        sys.exit(130)
 
     except Exception as e:
         logger.error("\n❌ Fatal error in main execution:")
@@ -523,3 +896,4 @@ Examples:
             )
             df_partial.to_csv(emergency_file, index=False)
             logger.info(f"Partial results saved to {emergency_file}")
+        sys.exit(1)

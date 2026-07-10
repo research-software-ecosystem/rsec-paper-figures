@@ -4,16 +4,17 @@ This repository contains code to reproduce all figures for the paper "The ELIXIR
 
 ## OpenAIRE Software Metadata Scraper
 
-The `openaire.py` script fetches research software metadata from the OpenAIRE API and generates temporal analyses.
+The `openaire.py` script fetches research software metadata from the OpenAIRE Graph API and generates temporal analyses.
 
 ### What it does
 
-- **Fetches software metadata** from the OpenAIRE API by month-year periods to bypass the 10k results limit
+- **Fetches research software metadata** from the OpenAIRE Graph API by month-year periods using `researchProducts?type=software`
 - **Collects** software title, publication year/month, URL, and persistent identifier (PID)
 - **Implements caching** via `requests-cache` to store API responses in an SQLite database, reducing redundant API calls on re-runs
-- **Handles errors gracefully** with automatic retries, exponential backoff, and recursive period splitting when limits are hit
+- **Handles errors gracefully** with automatic retries, exponential backoff, and cursor-based paging
+- **Respects OpenAIRE request limits** by using the documented maximum `pageSize=100`, cursor paging for result sets above the 10,000-record offset-paging limit, and conservative throttling for uncached API calls
 - **Saves checkpoints** after processing each year, allowing resumption if interrupted
-- **Generates a bar plot** showing the number of new software products per year (when `--plot` is specified)
+- **Generates a Plotnine bar plot** showing research software records by publication year (when `--plot` is specified)
 
 ### Usage
 
@@ -27,15 +28,30 @@ python openaire.py --start-year 2000 --end-year 2024
 # With custom output file and plot
 python openaire.py -s 2010 -e 2024 -o results.csv -p software_per_year.png
 
+# Generate the publication-year figure from annual counts without downloading all metadata
+python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_per_year.png
+
+# Generate a log-scale variant of the publication-year figure
+python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_per_year_log.png --y-scale log
+
+# Generate a log-scale variant with an exponential fit overlay
+python openaire.py --counts-only -o openaire_research_software_counts.csv -p openaire_research_software_exponential_fit_2014_2025.png --y-scale log --exponential-fit-start-year 2014 --exponential-fit-end-year 2025
+
+# Use an OpenAIRE personal access token for the higher authenticated request limit
+OPENAIRE_API_TOKEN=your_token python openaire.py --counts-only
+
 # Clear the API cache
 python openaire.py --clear-cache
 ```
 
+By default, uncached unauthenticated OpenAIRE requests are throttled to one request every 61 seconds, matching the public limit of 60 requests/hour. If `OPENAIRE_API_TOKEN` is set, requests use `Authorization: Bearer ...` and default to a 0.5 second interval, matching the authenticated limit of 7,200 requests/hour. The interval can be overridden with `OPENAIRE_REQUEST_INTERVAL_SECONDS`.
+
 ### Output
 
 - `openaire_software_complete.csv` (or custom `-o` filename): CSV with columns `title`, `year`, `month`, `year_month`, `url`, `pid`
+- `openaire_research_software_counts.csv` when `--counts-only` is used: CSV with columns `year`, `count`
 - `openaire_cache.sqlite`: Cached API responses
-- Optional PNG plot showing software publications per year
+- Optional PNG or SVG Plotnine chart showing research software records by publication year
 - Log files with timestamped execution details
 
 ---
