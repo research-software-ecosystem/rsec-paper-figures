@@ -19,6 +19,8 @@ The `openaire.py` script fetches research software metadata from the OpenAIRE Gr
 ### Usage
 
 ```bash
+cd fig1a
+
 # Basic usage - fetch from 1960 to current year
 python openaire.py
 
@@ -75,6 +77,8 @@ The `biotools_scatter.py` script analyzes bio.tools entries to compare publicati
 ### Usage
 
 ```bash
+cd fig1b
+
 # Process bio.tools data and generate plot
 python biotools_scatter.py --data-dir /path/to/content/data
 
