@@ -4,12 +4,12 @@ This repository contains code to reproduce all figures for the paper "The ELIXIR
 
 ## Setup
 
-From the repository root, activate the existing virtual environment and install the Python dependencies:
+From the repository root, create and activate a virtual environment and install the Python dependencies:
 
-```bash
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
+    python -m venv .venv
+    source .venv/bin/activate
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
 
 ## OpenAIRE Software Metadata Scraper
 
