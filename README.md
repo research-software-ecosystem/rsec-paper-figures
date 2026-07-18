@@ -2,6 +2,15 @@
 
 This repository contains code to reproduce all figures for the paper "The ELIXIR Research Software Ecosystem: An Open Metadata Commons for Software".
 
+## Setup
+
+From the repository root, activate the existing virtual environment and install the Python dependencies:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
 ## OpenAIRE Software Metadata Scraper
 
 The `openaire.py` script fetches research software metadata from the OpenAIRE Graph API and generates temporal analyses.
@@ -77,13 +86,16 @@ The `biotools_scatter.py` script analyzes bio.tools entries to compare publicati
 ### Usage
 
 ```bash
+# Download the bio.tools JSON corpus into a sibling directory
+git clone --depth 1 https://github.com/research-software-ecosystem/metadata-commons.git ../metadata-commons
+
 cd fig1b
 
 # Process bio.tools data and generate plot
-python biotools_scatter.py --data-dir /path/to/content/data
+python biotools_scatter.py --data-dir ../../metadata-commons/data
 
 # Custom output filename
-python biotools_scatter.py -d /path/to/content/data -o my_plot.png
+python biotools_scatter.py -d ../../metadata-commons/data -o my_plot.png
 
 # Clear the DOI cache
 python biotools_scatter.py --clear-cache
