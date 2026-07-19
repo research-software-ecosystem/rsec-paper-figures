@@ -97,7 +97,7 @@ def extract_info_from_json(json_file):
             if doi_metadata is not None:
                 all_publication_date_strings.append(doi_metadata['date'])
     
-    # Parse dates and find the most recent (latest) publication date
+    # Parse dates and find the earliest publication date
     all_publication_dates = []
     for date_string in all_publication_date_strings:
         if date_string is not None:
@@ -108,7 +108,7 @@ def extract_info_from_json(json_file):
     
     earliest_publication_date = None
     if all_publication_dates:
-        earliest_publication_date = max(all_publication_dates)
+        earliest_publication_date = min(all_publication_dates)
     
     addition_date = pd.to_datetime(data.get('additionDate'), utc=True)
     
