@@ -311,7 +311,7 @@ def process_biotools_files(data_dir, output_plot='biotools-entries-publication-s
     cache_misses = 0
     
     # Get list of files
-    file_list = list(glob.glob(glob_pattern))
+    file_list = sorted(glob.glob(glob_pattern))
     
     if not file_list:
         logger.error(f"No .biotools.json files found in {data_dir}")
