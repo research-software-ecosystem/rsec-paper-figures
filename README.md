@@ -76,7 +76,8 @@ The `biotools_scatter.py` script analyzes bio.tools entries to compare publicati
 - **Processes bio.tools JSON files** from the data directory structure
 - **Extracts publication dates** by fetching DOI metadata from Crossref API
 - **Compares dates** between first publication and bio.tools entry creation
-- **Implements caching** via `requests-cache` to store Crossref API responses in `doi_cache.sqlite`
+- **Implements two levels of caching**: Crossref API responses in `doi_cache.sqlite`, and processed bio.tools records in `biotools_processed_cache.sqlite`
+- **Resumes after interruption** by checkpointing processed records after every batch; unchanged source files are reused on later runs
 - **Generates a combined visualization** with:
   - Scatter plot of entry creation vs publication date
   - Marginal density distributions
@@ -97,7 +98,10 @@ python biotools_scatter.py --data-dir ../../metadata-commons/data
 # Custom output filename
 python biotools_scatter.py -d ../../metadata-commons/data -o my_plot.png
 
-# Clear the DOI cache
+# Checkpoint more frequently while processing new records
+python biotools_scatter.py -d ../../metadata-commons/data --batch-size 50
+
+# Clear both the DOI and processed-record caches
 python biotools_scatter.py --clear-cache
 ```
 
@@ -105,6 +109,7 @@ python biotools_scatter.py --clear-cache
 
 - `biotools-entries-publication-combined.png` (or custom `-o` filename): Combined scatter plot with marginal distributions
 - `doi_cache.sqlite`: Cached Crossref API responses
+- `biotools_processed_cache.sqlite`: Cached extracted dates for unchanged bio.tools source files
 - Log files with timestamped execution details and summary statistics
 
 ---

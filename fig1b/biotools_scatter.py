@@ -1,5 +1,7 @@
 import json
 import glob
+import sqlite3
+from pathlib import Path
 import pandas as pd
 import requests
 import requests_cache
@@ -22,9 +24,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Setup DOI cache
-requests_cache.install_cache('doi_cache')
-logger.info("DOI cache enabled: doi_cache.sqlite")
+# Keep caches beside this script, regardless of the directory it is run from.
+SCRIPT_DIR = Path(__file__).resolve().parent
+DOI_CACHE_PATH = SCRIPT_DIR / 'doi_cache'
+PROCESSED_CACHE_PATH = SCRIPT_DIR / 'biotools_processed_cache.sqlite'
+
+# Cache Crossref responses so repeated DOI lookups do not hit the API.
+doi_session = requests_cache.CachedSession(str(DOI_CACHE_PATH))
+logger.info(f"DOI cache enabled: {DOI_CACHE_PATH}.sqlite")
 
 
 def get_doi_metadata(doi):
@@ -43,7 +50,7 @@ def get_doi_metadata(doi):
     url = f"https://api.crossref.org/works/{doi}"
     
     try:
-        response = requests.get(url, timeout=30)
+        response = doi_session.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
         
@@ -130,6 +137,80 @@ def process_single_file(filepath):
         return None
 
 
+def open_processed_cache(cache_path=PROCESSED_CACHE_PATH):
+    """Open the persistent cache of results extracted from bio.tools files."""
+    connection = sqlite3.connect(cache_path)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_results (
+            filepath TEXT PRIMARY KEY,
+            mtime_ns INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            biotools_id TEXT,
+            primary_date TEXT,
+            addition_date TEXT
+        )
+        """
+    )
+    return connection
+
+
+def get_cached_result(connection, filepath):
+    """Return a cached result when the source file has not changed."""
+    file_stat = Path(filepath).stat()
+    row = connection.execute(
+        """
+        SELECT biotools_id, primary_date, addition_date
+        FROM file_results
+        WHERE filepath = ? AND mtime_ns = ? AND size = ?
+        """,
+        (str(Path(filepath).resolve()), file_stat.st_mtime_ns, file_stat.st_size),
+    ).fetchone()
+    if row is None:
+        return None
+
+    biotools_id, primary_date, addition_date = row
+    return {
+        'file': filepath,
+        'biotoolsID': biotools_id,
+        'primary_date': primary_date,
+        'addition_date': addition_date,
+    }
+
+
+def cache_result(connection, result):
+    """Store one processed result together with its source-file signature."""
+    filepath = Path(result['file'])
+    file_stat = filepath.stat()
+
+    def serialize_date(value):
+        if value is None or pd.isna(value):
+            return None
+        return pd.Timestamp(value).isoformat()
+
+    connection.execute(
+        """
+        INSERT INTO file_results (
+            filepath, mtime_ns, size, biotools_id, primary_date, addition_date
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(filepath) DO UPDATE SET
+            mtime_ns = excluded.mtime_ns,
+            size = excluded.size,
+            biotools_id = excluded.biotools_id,
+            primary_date = excluded.primary_date,
+            addition_date = excluded.addition_date
+        """,
+        (
+            str(filepath.resolve()),
+            file_stat.st_mtime_ns,
+            file_stat.st_size,
+            result['biotoolsID'],
+            serialize_date(result['primary_date']),
+            serialize_date(result['addition_date']),
+        ),
+    )
+
+
 def clean_crossref_placeholders(df, date_col='primary_date'):
     """Clean publisher deposit errors & placeholders."""
     df[date_col] = pd.to_datetime(df[date_col])
@@ -181,23 +262,23 @@ def plot_combined(df, output_file='biotools-entries-publication-combined.png'):
     # Apply to the joint plot axis
     g.ax_joint.set_ylim(bottom=earliest_addition_date, top=latest_addition_date)
 
-    # Add 2% padding so points don't sit exactly on the top edge
+    # Add 50% padding so points don't sit exactly on the top edge
     g.ax_joint.margins(y=0.5)
 
     g.ax_joint.set_xlabel('Primary Date (First Publication)', fontsize=12, fontweight='bold')
     g.ax_joint.set_ylabel('Addition Date (Entry Creation)', fontsize=12, fontweight='bold')
-    g.fig.suptitle('Timeline: Entry Creation vs Publication Date', 
+    g.figure.suptitle('Timeline: Entry Creation vs Publication Date',
                 fontsize=14, fontweight='bold', y=1.02)
 
     # DATE FIXING: Move colorbar to the right to avoid marginal plots
     # 1. Reduce the right margin of the subplots to make room for colorbar
-    g.fig.subplots_adjust(right=0.85)
+    g.figure.subplots_adjust(right=0.85)
 
     # 2. Create a new axes specifically for the colorbar [left, bottom, width, height]
-    cax = g.fig.add_axes([0.87, 0.2, 0.02, 0.6])  # Positioned at 87% from left, spanning 60% height
+    cax = g.figure.add_axes([0.87, 0.2, 0.02, 0.6])  # Positioned at 87% from left, spanning 60% height
 
     # 3. Add colorbar to this new axes
-    cbar = g.fig.colorbar(scatter, cax=cax)
+    cbar = g.figure.colorbar(scatter, cax=cax)
     cbar.set_label('Days Difference', fontsize=11, fontweight='bold')
 
     # Date formatting
@@ -211,8 +292,8 @@ def plot_combined(df, output_file='biotools-entries-publication-combined.png'):
     plt.close()
 
 
-def process_biotools_files(data_dir, output_plot='biotools-entries-publication-scatterplot.png', 
-                          batch_size=10000):
+def process_biotools_files(data_dir, output_plot='biotools-entries-publication-scatterplot.png',
+                          batch_size=100):
     """
     Process bio.tools JSON files and generate scatter plot.
     
@@ -221,8 +302,13 @@ def process_biotools_files(data_dir, output_plot='biotools-entries-publication-s
         output_plot (str): Output filename for the scatter plot
         batch_size (int): Number of files to process in each batch
     """
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
     glob_pattern = f'{data_dir}/*/*.biotools.json'
     results = []
+    cache_hits = 0
+    cache_misses = 0
     
     # Get list of files
     file_list = list(glob.glob(glob_pattern))
@@ -234,16 +320,32 @@ def process_biotools_files(data_dir, output_plot='biotools-entries-publication-s
     num_batches = (len(file_list) + batch_size - 1) // batch_size
     logger.info(f"Processing {len(file_list)} files in {num_batches} batches...")
     
-    for i in range(0, len(file_list), batch_size):
-        batch = file_list[i:i+batch_size]
-        batch_num = i // batch_size + 1
-        
-        logger.info(f"Processing batch {batch_num}/{num_batches}")
-        
-        for filepath in batch:
-            result = process_single_file(filepath)
-            if result is not None:
-                results.append(result)
+    with open_processed_cache() as processed_cache:
+        for i in range(0, len(file_list), batch_size):
+            batch = file_list[i:i+batch_size]
+            batch_num = i // batch_size + 1
+
+            logger.info(f"Processing batch {batch_num}/{num_batches}")
+
+            for filepath in batch:
+                result = get_cached_result(processed_cache, filepath)
+                if result is not None:
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
+                    result = process_single_file(filepath)
+                    if result is not None:
+                        cache_result(processed_cache, result)
+
+                if result is not None:
+                    results.append(result)
+
+            # Checkpoint each batch so an interrupted run can resume here.
+            processed_cache.commit()
+            logger.info(
+                f"Batch {batch_num}/{num_batches} complete "
+                f"(cache hits: {cache_hits}, processed: {cache_misses})"
+            )
     
     # Load the results into a Pandas DataFrame
     df = pd.DataFrame(results)
@@ -252,6 +354,8 @@ def process_biotools_files(data_dir, output_plot='biotools-entries-publication-s
     df['addition_date'] = pd.to_datetime(df['addition_date'], utc=True)
     
     logger.info(f"Processed {len(df)} entries")
+    logger.info(f"Processed-file cache hits: {cache_hits}")
+    logger.info(f"Files processed this run: {cache_misses}")
     
     # Clean the data
     df = clean_crossref_placeholders(df)
@@ -291,7 +395,7 @@ if __name__ == "__main__":
 Examples:
   python biotools_scatter.py --data-dir /path/to/content/data
   python biotools_scatter.py -d /path/to/content/data -o my_plot.png
-  python biotools_scatter.py --clear-cache   # Clear the DOI cache and exit
+  python biotools_scatter.py --clear-cache   # Clear all caches and exit
         """,
     )
     parser.add_argument(
@@ -306,19 +410,30 @@ Examples:
         help="Output plot file name (default: biotools-entries-publication-combined.png)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Files per checkpointed batch (default: 100)",
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
-        help="Clear the DOI cache and exit",
+        help="Clear the DOI and processed-file caches, then exit",
     )
     
     args = parser.parse_args()
+
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
     
     if args.clear_cache:
-        requests_cache.clear()
-        logger.info("DOI cache cleared. Exiting.")
+        doi_session.cache.clear()
+        if PROCESSED_CACHE_PATH.exists():
+            PROCESSED_CACHE_PATH.unlink()
+        logger.info("DOI and processed-file caches cleared. Exiting.")
         sys.exit(0)
 
     if not args.data_dir:
         parser.error("--data-dir is required unless --clear-cache is used")
     
-    process_biotools_files(args.data_dir, args.output)
+    process_biotools_files(args.data_dir, args.output, args.batch_size)
