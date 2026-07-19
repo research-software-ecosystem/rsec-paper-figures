@@ -12,6 +12,7 @@ import seaborn as sns
 import argparse
 import logging
 import sys
+from contextlib import contextmanager
 
 # Setup logging
 logging.basicConfig(
@@ -137,22 +138,27 @@ def process_single_file(filepath):
         return None
 
 
+@contextmanager
 def open_processed_cache(cache_path=PROCESSED_CACHE_PATH):
-    """Open the persistent cache of results extracted from bio.tools files."""
+    """Open the processed-results cache and close it on context exit."""
     connection = sqlite3.connect(cache_path)
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS file_results (
-            filepath TEXT PRIMARY KEY,
-            mtime_ns INTEGER NOT NULL,
-            size INTEGER NOT NULL,
-            biotools_id TEXT,
-            primary_date TEXT,
-            addition_date TEXT
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_results (
+                filepath TEXT PRIMARY KEY,
+                mtime_ns INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                biotools_id TEXT,
+                primary_date TEXT,
+                addition_date TEXT
+            )
+            """
         )
-        """
-    )
-    return connection
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def get_cached_result(connection, filepath):
