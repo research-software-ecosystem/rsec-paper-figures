@@ -25,6 +25,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+AXIS_LABEL_FONT_SIZE = 15
+TICK_FONT_SIZE = 14
+TITLE_FONT_SIZE = 18
+LEGEND_FONT_SIZE = 14
+COLORBAR_LABEL_FONT_SIZE = 14
+
 # Keep caches beside this script, regardless of the directory it is run from.
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOI_CACHE_PATH = SCRIPT_DIR / 'doi_cache'
@@ -271,10 +277,18 @@ def plot_combined(df, output_file='biotools-entries-publication-combined.png'):
     # Add 50% padding so points don't sit exactly on the top edge
     g.ax_joint.margins(y=0.5)
 
-    g.ax_joint.set_xlabel('Primary Date (First Publication)', fontsize=12, fontweight='bold')
-    g.ax_joint.set_ylabel('Addition Date (Entry Creation)', fontsize=12, fontweight='bold')
-    g.figure.suptitle('Timeline: Entry Creation vs Publication Date',
-                fontsize=14, fontweight='bold', y=1.02)
+    g.ax_joint.set_xlabel(
+        'Primary date (first publication)',
+        fontsize=AXIS_LABEL_FONT_SIZE,
+        fontweight='bold',
+    )
+    g.ax_joint.set_ylabel(
+        'Addition date (entry creation)',
+        fontsize=AXIS_LABEL_FONT_SIZE,
+        fontweight='bold',
+    )
+    g.figure.suptitle('Timeline: entry creation vs publication date',
+                fontsize=TITLE_FONT_SIZE, fontweight='bold', y=1.02)
 
     # DATE FIXING: Move colorbar to the right to avoid marginal plots
     # 1. Reduce the right margin of the subplots to make room for colorbar
@@ -285,14 +299,27 @@ def plot_combined(df, output_file='biotools-entries-publication-combined.png'):
 
     # 3. Add colorbar to this new axes
     cbar = g.figure.colorbar(scatter, cax=cax)
-    cbar.set_label('Days Difference', fontsize=11, fontweight='bold')
+    cbar.set_label(
+        'Days difference',
+        fontsize=COLORBAR_LABEL_FONT_SIZE,
+        fontweight='bold',
+    )
+    cbar.ax.tick_params(labelsize=TICK_FONT_SIZE)
 
     # Date formatting
     g.ax_joint.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     g.ax_joint.yaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.setp(g.ax_joint.get_xticklabels(), rotation=45)
-    plt.setp(g.ax_joint.get_yticklabels(), rotation=45)
-    g.ax_joint.legend(fontsize=10, loc='upper left')
+    plt.setp(
+        g.ax_joint.get_xticklabels(),
+        rotation=45,
+        fontsize=TICK_FONT_SIZE,
+    )
+    plt.setp(
+        g.ax_joint.get_yticklabels(),
+        rotation=45,
+        fontsize=TICK_FONT_SIZE,
+    )
+    g.ax_joint.legend(fontsize=LEGEND_FONT_SIZE, loc='upper left')
     plt.savefig(output_file, format='png', dpi=300, bbox_inches='tight')
     logger.info(f"Combined plot saved to {output_file}")
     plt.close()
@@ -356,8 +383,14 @@ def process_biotools_files(data_dir, output_plot='biotools-entries-publication-s
     # Load the results into a Pandas DataFrame
     df = pd.DataFrame(results)
     
-    df['primary_date'] = pd.to_datetime(df['primary_date'], utc=True)
-    df['addition_date'] = pd.to_datetime(df['addition_date'], utc=True)
+    # bio.tools timestamps legitimately mix whole-second and fractional-second
+    # ISO-8601 values, so do not infer one format for the entire column.
+    df['primary_date'] = pd.to_datetime(
+        df['primary_date'], utc=True, format='mixed'
+    )
+    df['addition_date'] = pd.to_datetime(
+        df['addition_date'], utc=True, format='mixed'
+    )
     
     logger.info(f"Processed {len(df)} entries")
     logger.info(f"Processed-file cache hits: {cache_hits}")

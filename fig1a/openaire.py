@@ -620,14 +620,6 @@ def plot_research_software_counts(
     plot = (
         ggplot(plot_df, aes(x="year", y="count", fill="period"))
         + geom_col(width=0.82, color="#FFFFFF", size=0.3)
-        + geom_text(
-            data=label_df,
-            mapping=aes(y="label_y", label="label"),
-            size=7,
-            color="#22313F",
-            va="bottom",
-            show_legend=False,
-        )
         + scale_fill_manual(
             values=period_colors,
             breaks=active_periods,
@@ -646,7 +638,9 @@ def plot_research_software_counts(
             y="Number of records",
             caption=f"Source: OpenAIRE Graph API. Retrieved {datetime.now():%Y-%m-%d}.",
         )
-        + theme_minimal(base_size=12, base_family="DejaVu Sans")
+        + theme_minimal(
+            base_size=16, base_family="DejaVu Sans"
+        )
         + theme(
             figure_size=(12, 8),
             dpi=300,
@@ -660,10 +654,10 @@ def plot_research_software_counts(
             axis_title_x=element_text(margin={"t": 10}),
             axis_title_y=element_text(margin={"r": 10}),
             plot_title=element_text(
-                size=17, weight="bold", color="#1F2933", ha="center"
+                size=20, weight="bold", color="#1F2933", ha="center"
             ),
-            plot_subtitle=element_text(size=11, color="#52616B", ha="center"),
-            plot_caption=element_text(size=9, color="#6B7280", ha="center"),
+            plot_subtitle=element_text(size=14, color="#52616B", ha="center"),
+            plot_caption=element_text(size=11, color="#6B7280", ha="center"),
             legend_position="top",
             legend_title=element_blank(),
             legend_background=element_blank(),
@@ -691,6 +685,16 @@ def plot_research_software_counts(
                 name="",
             )
         )
+
+    # Draw labels last so they remain legible above the optional trendline.
+    plot = plot + geom_text(
+        data=label_df,
+        mapping=aes(y="label_y", label="label"),
+        size=10,
+        color="#22313F",
+        va="bottom",
+        show_legend=False,
+    )
 
     plot.save(plot_file, width=12, height=8, dpi=300, verbose=False)
 
