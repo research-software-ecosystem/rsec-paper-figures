@@ -8,6 +8,7 @@ import requests_cache
 from datetime import datetime
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 import argparse
 import logging
@@ -33,8 +34,26 @@ COLORBAR_LABEL_FONT_SIZE = 14
 
 # Keep caches beside this script, regardless of the directory it is run from.
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from rsec_palette import (
+    RSEC_CYAN,
+    RSEC_GRAY,
+    RSEC_ORANGE,
+    RSEC_PASTEL_CYAN,
+    RSEC_PASTEL_GRAY,
+    RSEC_PASTEL_ORANGE,
+)
+
 DOI_CACHE_PATH = SCRIPT_DIR / 'doi_cache'
 PROCESSED_CACHE_PATH = SCRIPT_DIR / 'biotools_processed_cache.sqlite'
+
+RSEC_PASTEL_CMAP = LinearSegmentedColormap.from_list(
+    "rsec_pastel",
+    [RSEC_PASTEL_GRAY, RSEC_PASTEL_CYAN, RSEC_PASTEL_ORANGE],
+)
 
 # Cache Crossref responses so repeated DOI lookups do not hit the API.
 doi_session = requests_cache.CachedSession(str(DOI_CACHE_PATH))
@@ -257,16 +276,24 @@ def plot_combined(df, output_file='biotools-entries-publication-combined.png'):
 
     # Main scatter plot
     scatter = g.ax_joint.scatter(df['primary_date'], df['addition_date'], 
-                                c=df['days_difference'], cmap='viridis', 
-                                s=120, alpha=0.7, edgecolors='black', linewidth=0.5)
+                                c=df['days_difference'], cmap=RSEC_PASTEL_CMAP,
+                                s=120, alpha=0.78, edgecolors=RSEC_GRAY,
+                                linewidth=0.5)
 
     # Marginal density curves
-    g.plot_marginals(sns.kdeplot, color='darkblue', fill=True, alpha=0.5, linewidth=1.5)
+    g.plot_marginals(
+        sns.kdeplot,
+        color=RSEC_CYAN,
+        fill=True,
+        alpha=0.65,
+        linewidth=1.5,
+    )
 
     # Reference line and formatting (same as before)...
     g.ax_joint.plot([df['primary_date'].min(), df['primary_date'].max()], 
                     [df['primary_date'].min(), df['primary_date'].max()], 
-                    'r--', alpha=0.5, label='Same date line', linewidth=2)
+                    linestyle='--', color=RSEC_ORANGE, alpha=0.8,
+                    label='Same date line', linewidth=2)
     # Calculate both limits
     earliest_addition_date = df['addition_date'].min()
     latest_addition_date = df['addition_date'].max()  # Get the max date
