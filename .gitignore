@@ -60,5 +60,5 @@ Thumbs.db
 # Temporary csv files
 *.csv
 
-# doi cache
-doi_cache.sqlite
+# sqlite caches
+*.sqlite

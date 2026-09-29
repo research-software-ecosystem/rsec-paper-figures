@@ -4,10 +4,24 @@ import time
 import traceback
 import logging
 import os
+import sys
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
+from pathlib import Path
 from requests_cache import CachedSession
 from calendar import monthrange
+
+# Keep the figure palette shared with Figure 1B.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from rsec_palette import (
+    RSEC_ORANGE,
+    RSEC_PASTEL_CYAN,
+    RSEC_PASTEL_GRAY,
+    RSEC_PASTEL_ORANGE,
+)
 
 try:
     from plotnine import (
@@ -485,9 +499,9 @@ def make_plot_dataframe(year_counts, y_scale):
     label_df = plot_df[(plot_df["year"] % 5 == 0) & (plot_df["count"] > 0)].copy()
     label_df["label"] = label_df["count"].map(lambda count: f"{count:,}")
     if y_scale == "log":
-        label_df["label_y"] = label_df["count"] * 1.2
+        label_df["label_y"] = label_df["count"] * 1
     else:
-        label_df["label_y"] = label_df["count"] + max_count * 0.018
+        label_df["label_y"] = label_df["count"] + max_count * 0.025
 
     return plot_df, label_df
 
@@ -564,6 +578,21 @@ def plot_research_software_counts(
         )
         visible_max = max(visible_max, fit_df["fit_count"].max())
 
+        # Keep the five-year total labels clear of the fitted line as well as
+        # their bars.
+        fitted_counts_by_year = fit_df.set_index("year")["fit_count"]
+        label_df["fit_count"] = label_df["year"].map(fitted_counts_by_year)
+        if y_scale == "log":
+            label_df["label_y"] = np.maximum(
+                label_df["label_y"],
+                label_df["fit_count"].fillna(0) * 1.25,
+            )
+        else:
+            label_df["label_y"] = np.maximum(
+                label_df["label_y"],
+                label_df["fit_count"].fillna(0) + visible_max * 0.025,
+            )
+
     label_upper_limit = (
         label_df["label_y"].max() * 1.08 if not label_df.empty else max_count
     )
@@ -593,7 +622,7 @@ def plot_research_software_counts(
 
     y_scale_layer = (
         scale_y_symlog(
-            breaks=[1, 10, 100, 1000, 10000, 100000],
+            breaks=[0, 1, 10, 100, 1000, 10000, 100000],
             labels=format_count_labels,
             limits=(0, y_upper_limit),
             expand=(0.02, 0),
@@ -607,9 +636,9 @@ def plot_research_software_counts(
     )
 
     period_colors = {
-        f"Before {PLOT_HIGHLIGHT_START_YEAR}": "#9CA3AF",
-        f"{PLOT_HIGHLIGHT_START_YEAR} onward": "#2A9D8F",
-        f"{datetime.now().year} to date": "#E76F51",
+        f"Before {PLOT_HIGHLIGHT_START_YEAR}": RSEC_PASTEL_GRAY,
+        f"{PLOT_HIGHLIGHT_START_YEAR} onward": RSEC_PASTEL_CYAN,
+        f"{datetime.now().year} to date": RSEC_PASTEL_ORANGE,
     }
     active_periods = [
         period
@@ -620,14 +649,6 @@ def plot_research_software_counts(
     plot = (
         ggplot(plot_df, aes(x="year", y="count", fill="period"))
         + geom_col(width=0.82, color="#FFFFFF", size=0.3)
-        + geom_text(
-            data=label_df,
-            mapping=aes(y="label_y", label="label"),
-            size=7,
-            color="#22313F",
-            va="bottom",
-            show_legend=False,
-        )
         + scale_fill_manual(
             values=period_colors,
             breaks=active_periods,
@@ -646,24 +667,26 @@ def plot_research_software_counts(
             y="Number of records",
             caption=f"Source: OpenAIRE Graph API. Retrieved {datetime.now():%Y-%m-%d}.",
         )
-        + theme_minimal(base_size=12, base_family="DejaVu Sans")
+        + theme_minimal(
+            base_size=16, base_family="DejaVu Sans"
+        )
         + theme(
             figure_size=(12, 8),
             dpi=300,
             svg_usefonts=False,
             plot_background=element_rect(fill="#FFFFFF", color="#FFFFFF"),
             panel_background=element_rect(fill="#FFFFFF", color="#FFFFFF"),
-            panel_grid_major_x=element_blank(),
+            panel_grid_major_x=element_line(color="#E5E7EB", size=0.35),
             panel_grid_minor=element_blank(),
             panel_grid_major_y=element_line(color="#D8DEE4", size=0.45),
-            axis_text_x=element_text(rotation=35, ha="right"),
+            axis_text_x=element_text(rotation=0, ha="center"),
             axis_title_x=element_text(margin={"t": 10}),
             axis_title_y=element_text(margin={"r": 10}),
             plot_title=element_text(
-                size=17, weight="bold", color="#1F2933", ha="center"
+                size=20, weight="bold", color="#1F2933", ha="center"
             ),
-            plot_subtitle=element_text(size=11, color="#52616B", ha="center"),
-            plot_caption=element_text(size=9, color="#6B7280", ha="center"),
+            plot_subtitle=element_text(size=14, color="#52616B", ha="center"),
+            plot_caption=element_text(size=11, color="#6B7280", ha="center"),
             legend_position="top",
             legend_title=element_blank(),
             legend_background=element_blank(),
@@ -686,11 +709,21 @@ def plot_research_software_counts(
                 size=2.5,
             )
             + scale_color_manual(
-                values={fit_stats["series"]: "#D1495B"},
+                values={fit_stats["series"]: RSEC_ORANGE},
                 breaks=[fit_stats["series"]],
                 name="",
             )
         )
+
+    # Draw labels last so they remain legible above the optional trendline.
+    plot = plot + geom_text(
+        data=label_df,
+        mapping=aes(y="label_y", label="label"),
+        size=10,
+        color="#22313F",
+        va="bottom",
+        show_legend=False,
+    )
 
     plot.save(plot_file, width=12, height=8, dpi=300, verbose=False)
 
